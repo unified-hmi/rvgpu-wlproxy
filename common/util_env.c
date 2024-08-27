@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (c) 2024  Panasonic Automotive Systems, Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <stdlib.h>
+
+int getenv_int(char *env_name, int default_var)
+{
+	char *var = getenv(env_name);
+	if (var)
+		return atoi(var);
+	else
+		return default_var;
+}
+
+char *getenv_str(char *env_name, char *default_var)
+{
+	char *var = getenv(env_name);
+	if (var)
+		return var;
+	else
+		return default_var;
+}
