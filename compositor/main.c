@@ -59,6 +59,7 @@ typedef struct appopt_t {
 	int win_w, win_h;
 	char *socket_name;
 	bool sfc_fullscreen;
+	bool windowed;
 	bool vsync;
 } appopt_t;
 
@@ -1169,6 +1170,7 @@ static appopt_t parse_opt(int argc, char *argv[])
 	char *socket_name = NULL;
 	bool sfc_fullscreen = false;
 	bool vsync = false;
+	bool windowed = false;
 
 	{
 		int c;
@@ -1181,6 +1183,7 @@ static appopt_t parse_opt(int argc, char *argv[])
 					ELOG("%s invalid compositor size %s\n",
 					     __FUNCTION__, optarg);
 				}
+				windowed = true;
 				break;
 			case 'S':
 				socket_name = optarg;
@@ -1204,6 +1207,7 @@ static appopt_t parse_opt(int argc, char *argv[])
 	appopt.win_h = win_h;
 	appopt.socket_name = socket_name;
 	appopt.sfc_fullscreen = sfc_fullscreen;
+	appopt.windowed = windowed;
 	appopt.vsync = vsync;
 	return appopt;
 }
@@ -1323,6 +1327,7 @@ int main(int argc, char *argv[])
 	int win_w = appopt.win_w;
 	int win_h = appopt.win_h;
 	bool sfc_fullscreen = appopt.sfc_fullscreen;
+	bool windowed = appopt.windowed;
 	bool vsync = appopt.vsync;
 
 	struct wl_display *wl_dpy = wl_display_create();
@@ -1330,30 +1335,7 @@ int main(int argc, char *argv[])
 	if (ret == -1)
 		return 0;
 
-	compositor *compositor = calloc(sizeof(*compositor), 1);
-	compositor->wl_display = wl_dpy;
-	compositor->width = win_w;
-	compositor->height = win_h;
-	compositor->sfc_fullscreen = sfc_fullscreen;
-	pthread_mutex_init(&compositor->event_mutex, NULL);
-	wl_list_init(&compositor->surface_list);
-	wl_list_init(&compositor->client_list);
-
-	wl_global_create(wl_dpy, &wl_compositor_interface, 4, compositor,
-			 compositor_bind);
-	wl_global_create(wl_dpy, &wl_output_interface, 3, compositor,
-			 output_bind);
-	wl_global_create(wl_dpy, &wl_shell_interface, 1, compositor,
-			 wl_shell_bind);
-	wl_global_create(wl_dpy, &xdg_wm_base_interface, 1, compositor,
-			 xdg_shell_bind);
-	wl_display_init_shm(wl_dpy);
-
-	struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);
-	wl_event_loop_add_signal(eloop, SIGINT, handle_signal, compositor);
-	wl_event_loop_add_signal(eloop, SIGTERM, handle_signal, compositor);
-
-	ret = egl_init_with_platform_window_surface(2, 0, 0, 0, win_w, win_h);
+	ret = egl_init_with_platform_window_surface(2, 0, 0, 0, &win_w, &win_h, windowed);
 	if (ret == -1)
 		goto out;
 	ret = egl_set_swap_interval(vsync);
@@ -1371,6 +1353,29 @@ int main(int argc, char *argv[])
 	ret = egl_show_gl_info();
 	if (ret == -1)
 		goto out;
+
+        compositor *compositor = calloc(sizeof(*compositor), 1);
+        compositor->wl_display = wl_dpy;
+        compositor->width = win_w;
+        compositor->height = win_h;
+        compositor->sfc_fullscreen = sfc_fullscreen;
+        pthread_mutex_init(&compositor->event_mutex, NULL);
+        wl_list_init(&compositor->surface_list);
+        wl_list_init(&compositor->client_list);
+
+        wl_global_create(wl_dpy, &wl_compositor_interface, 4, compositor,
+                         compositor_bind);
+        wl_global_create(wl_dpy, &wl_output_interface, 3, compositor,
+                         output_bind);
+        wl_global_create(wl_dpy, &wl_shell_interface, 1, compositor,
+                         wl_shell_bind);
+        wl_global_create(wl_dpy, &xdg_wm_base_interface, 1, compositor,
+                         xdg_shell_bind);
+        wl_display_init_shm(wl_dpy);
+
+        struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);
+        wl_event_loop_add_signal(eloop, SIGINT, handle_signal, compositor);
+        wl_event_loop_add_signal(eloop, SIGTERM, handle_signal, compositor);
 
 	init_2d_renderer(win_w, win_h);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);

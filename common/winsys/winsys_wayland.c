@@ -443,7 +443,7 @@ void *winsys_init_native_display(void)
 	;
 }
 
-void *winsys_init_native_window(void *dpy, int win_w, int win_h)
+void *winsys_init_native_window(void *dpy, int *win_w, int *win_h, bool windowed)
 {
 	UNUSED(dpy);
 	memset(&s_window, 0, sizeof(s_window));
@@ -470,13 +470,13 @@ void *winsys_init_native_window(void *dpy, int win_w, int win_h)
 	wl_shell_surface_add_listener(s_window.wlShellSurface,
 				      &shell_surface_listener, &s_window);
 
-	s_window.window_size.width = win_w;
-	s_window.window_size.height = win_h;
+	s_window.window_size.width = *win_w;
+	s_window.window_size.height = *win_h;
 	s_window.display = &s_display;
 	toggle_fullscreen(&s_window, 0);
 
 	s_window.wlEGLNativeWindow =
-		wl_egl_window_create(s_window.wlSurface, win_w, win_h);
+		wl_egl_window_create(s_window.wlSurface, *win_w, *win_h);
 	if (s_window.wlEGLNativeWindow == NULL) {
 		ELOG("%s\n", __FUNCTION__);
 		return 0;

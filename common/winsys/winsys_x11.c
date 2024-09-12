@@ -34,6 +34,7 @@
 #include <linux/input-event-codes.h>
 #define UNUSED(x) (void)(x)
 
+#include <X11/Xatom.h> // Make sure this header is included for XA_ATOM
 static Display *s_xdpy = NULL;
 static Window s_xwin;
 
@@ -319,17 +320,21 @@ void *winsys_init_native_display(void)
 	return (void *)xdpy;
 }
 
-void *winsys_init_native_window(void *dpy, int win_w, int win_h)
+void *winsys_init_native_window(void *dpy, int *win_w, int *win_h, bool windowed)
 {
 	UNUSED(dpy); /* We use XDisplay instead of EGLDisplay. */
 	Display *xdpy = s_xdpy;
 
+	int screen = DefaultScreen(xdpy);
 	unsigned long black = BlackPixel(xdpy, DefaultScreen(xdpy));
 	unsigned long white = WhitePixel(xdpy, DefaultScreen(xdpy));
 
+	Window root = RootWindow(xdpy, screen);
+
 	Window xwin =
-		XCreateSimpleWindow(xdpy, RootWindow(xdpy, DefaultScreen(xdpy)),
-				    0, 0, win_w, win_h, 1, black, white);
+		XCreateSimpleWindow(xdpy, root,
+				    0, 0, *win_w, *win_h, 1, black, white);
+
 	XMapWindow(xdpy, xwin);
 	XSelectInput(xdpy, xwin,
 		     ButtonPressMask | ButtonReleaseMask | Button1MotionMask |

@@ -693,36 +693,41 @@ static int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn,
 }
 
 static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
-			     modeset_dev_t *dev, int win_w, int win_h)
+			     modeset_dev_t *dev, int *win_w, int *win_h, bool windowed)
 {
 	int i, ret;
 	int max_h, max_v, max_refresh;
 	int found = 0;
 	/* select MODE. */
 	max_h = max_v = max_refresh = 0;
-	for (i = 0; i < conn->count_modes; i++) {
-		int h = conn->modes[i].hdisplay;
-		int v = conn->modes[i].vdisplay;
-		int refresh = conn->modes[i].vrefresh;
-
-		ILOG("mode [%2d/%2d] %4ux%4u@%d", i, conn->count_modes, h, v,
-		     refresh);
-		if ((h == win_w) && (v == win_h)) {
-			if (refresh > max_refresh) {
-				memcpy(&dev->mode, &conn->modes[i],
-				       sizeof(dev->mode));
-				max_refresh = refresh;
-				dev->width = max_h = h;
-				dev->height = max_v = v;
-				LOG("*");
+	if (windowed) {
+		for (i = 0; i < conn->count_modes; i++) {
+			int h = conn->modes[i].hdisplay;
+			int v = conn->modes[i].vdisplay;
+			int refresh = conn->modes[i].vrefresh;
+			ILOG("mode [%2d/%2d] %4ux%4u@%d", i, conn->count_modes, h, v, refresh);
+			if ((h == *win_w) && (v == *win_h)) {
+				if (refresh > max_refresh) {
+					memcpy(&dev->mode, &conn->modes[i], sizeof(dev->mode));
+					max_refresh = refresh;
+					dev->width = max_h = h;
+					dev->height = max_v = v;
+					LOG("*");
+				}
+				found = 1;
 			}
-			found = 1;
+			LOG("\n");
 		}
-		LOG("\n");
 	}
 
-	if (found == 0)
-		return -1;
+	if (found == 0) {
+		memcpy(&dev->mode, &conn->modes[0], sizeof(dev->mode));
+		dev->width = conn->modes[0].hdisplay;
+		dev->height = conn->modes[0].vdisplay;
+		*win_w = dev->width;
+		*win_h = dev->height;
+		ILOG("mode [%2d/%2d] %4ux%4u@%d*\n", 0, conn->count_modes, dev->width, dev->height, conn->modes[0].vrefresh);
+	}
 
 	/* find CRTC for this connector */
 	ret = modeset_find_crtc(fd, res, conn, dev);
@@ -738,7 +743,7 @@ static int modeset_setup_dev(int fd, drmModeRes *res, drmModeConnector *conn,
 	return 0;
 }
 
-static int create_drm_device(int win_w, int win_h)
+static int create_drm_device(int *win_w, int *win_h, bool windowed)
 {
 	int drm_fd = s_drm_fd;
 	modeset_dev_t *dev;
@@ -788,7 +793,7 @@ static int create_drm_device(int win_w, int win_h)
 
 		drmModeConnector *conn = drmModeGetConnector(
 			drm_fd, res->connectors[curConnIndx]);
-		ret = modeset_setup_dev(drm_fd, res, conn, dev, win_w, win_h);
+		ret = modeset_setup_dev(drm_fd, res, conn, dev, win_w, win_h, windowed);
 		if (ret) {
 			drmModeFreeConnector(conn);
 			continue;
@@ -807,17 +812,17 @@ static int create_drm_device(int win_w, int win_h)
 	return ret;
 }
 
-void *winsys_init_native_window(void *dpy, int win_w, int win_h)
+void *winsys_init_native_window(void *dpy, int *win_w, int *win_h, bool compositor_fullscreen)
 {
 	struct gbm_device *gbm = s_gbm;
 	struct gbm_surface *gbm_sfc;
 
-	if (create_drm_device(win_w, win_h) < 0) {
+	if (create_drm_device(win_w, win_h, compositor_fullscreen) < 0) {
 		ELOG("%s\n", __FUNCTION__);
 		exit(0);
 	}
 
-	gbm_sfc = gbm_surface_create(gbm, win_w, win_h, GBM_FORMAT_ARGB8888,
+	gbm_sfc = gbm_surface_create(gbm, *win_w, *win_h, GBM_FORMAT_ARGB8888,
 				     GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	if (gbm_sfc == NULL) {
 		ELOG("%s\n", __FUNCTION__);

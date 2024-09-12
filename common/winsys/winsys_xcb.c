@@ -380,7 +380,7 @@ void *winsys_init_native_display(void)
 	return (void *)xdpy;
 }
 
-void *winsys_init_native_window(void *dpy, int win_w, int win_h)
+void *winsys_init_native_window(void *dpy, int *win_w, int *win_h, bool windowed)
 {
 	UNUSED(dpy);
 
@@ -404,7 +404,7 @@ void *winsys_init_native_window(void *dpy, int win_w, int win_h)
 		XCB_COPY_FROM_PARENT, // depth
 		window,
 		screen->root, // parent window
-		0, 0, win_w, win_h, // x, y, w, h
+		0, 0, *win_w, *win_h, // x, y, w, h
 		0, // border width
 		XCB_WINDOW_CLASS_INPUT_OUTPUT, // class
 		screen->root_visual, // visual

@@ -21,7 +21,7 @@
 #include <stdbool.h>
 
 void *winsys_init_native_display(void);
-void *winsys_init_native_window(void *dpy, int win_w, int win_h);
+void *winsys_init_native_window(void *dpy, int *win_w, int *win_h, bool windowed);
 int winsys_swap(bool vsync);
 void *winsys_create_native_pixmap(int width, int height);
 #endif /* _WINSYS_H_ */

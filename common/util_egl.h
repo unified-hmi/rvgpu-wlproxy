@@ -31,7 +31,7 @@ extern "C" {
 
 int egl_init_with_platform_window_surface(int gles_version, int depth_size,
 					  int stencil_size, int sample_num,
-					  int win_w, int win_h);
+					  int *win_w, int *win_h, bool windowed);
 int egl_terminate();
 int egl_swap(bool vsync);
 int egl_set_swap_interval(bool vsync);
