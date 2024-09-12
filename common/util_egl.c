@@ -133,7 +133,7 @@ exit:
 
 int egl_init_with_platform_window_surface(int gles_version, int depth_size,
 					  int stencil_size, int sample_num,
-					  int win_w, int win_h)
+					  int *win_w, int *win_h, bool windowed)
 {
 	void *native_dpy, *native_win;
 	EGLint major, minor;
@@ -178,7 +178,7 @@ int egl_init_with_platform_window_surface(int gles_version, int depth_size,
 		}
 	}
 
-	native_win = winsys_init_native_window(s_dpy, win_w, win_h);
+	native_win = winsys_init_native_window(s_dpy, win_w, win_h, windowed);
 	if (native_win == NULL) {
 		ELOG("%s\n", __FUNCTION__);
 		return -1;
