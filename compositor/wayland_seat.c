@@ -578,6 +578,7 @@ static void touch_down_cb(int32_t id, int32_t x, int32_t y)
 	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
 	wl_touch_send_down(resource, serial, 0, focused_csfc->resource, id,
 			   fix_x, fix_y);
+	wl_touch_send_frame(resource);
 	wl_display_flush_clients(focused_csfc->compositor->wl_display);
 	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
 }
@@ -636,6 +637,7 @@ static void touch_motion_cb(int32_t id, int32_t x, int32_t y)
 
 	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
 	wl_touch_send_motion(resource, 0, id, fix_x, fix_y);
+	wl_touch_send_frame(resource);
 	wl_display_flush_clients(focused_csfc->compositor->wl_display);
 	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
 }
