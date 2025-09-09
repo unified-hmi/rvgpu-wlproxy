@@ -62,6 +62,7 @@ typedef struct compositor {
 	int width; /* compositor width  */
 	int height; /* compositor height */
 	bool sfc_fullscreen;
+	bool sfc_bind_zwp_linux_dmabuf_v1;
 	struct xkb_state *xkb_state;
 	struct {
 		uint32_t mods_depressed;
@@ -90,6 +91,7 @@ typedef struct compositor_surface {
 	GLuint texid[2];
 	int status[2];
 	GLsync glsyncobj_tex;
+	struct imported_egl_tex *imp;
 	int current_tex_index;
 	int updated_tex_index;
 	int img_w; /* shm_buffer width      */

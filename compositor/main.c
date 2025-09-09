@@ -28,6 +28,7 @@
 #include "util_render2d.h"
 #include "util_log.h"
 #include "compositor.h"
+#include "linux-dma.h"
 #include <string.h>
 #include <poll.h>
 #include <time.h>
@@ -63,11 +64,11 @@ typedef struct appopt_t {
 	bool vsync;
 } appopt_t;
 
-static PFNEGLBINDWAYLANDDISPLAYWL eglBindWaylandDisplayWL;
-static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
-static PFNEGLQUERYWAYLANDBUFFERWL eglQueryWaylandBufferWL;
-static PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
-static PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+PFNEGLBINDWAYLANDDISPLAYWL eglBindWaylandDisplayWL;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+PFNEGLQUERYWAYLANDBUFFERWL eglQueryWaylandBufferWL;
+PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 
 /*--------------------------------------------------------------------------- *
  *  wl_surface
@@ -86,6 +87,13 @@ static void surface_attach(struct wl_client *client,
 	DLOG("%s\n", __FUNCTION__);
 	compositor_surface *csfc = wl_resource_get_user_data(resource);
 	csfc->wl_buffer = buffer_resource;
+	if (csfc->compositor->sfc_bind_zwp_linux_dmabuf_v1) {
+		struct linux_dmabuf_buffer *dmabuf = wl_resource_get_user_data(buffer_resource);
+		if (dmabuf != NULL) {
+			struct imported_egl_tex *imp = (struct imported_egl_tex *)dmabuf->user_data;
+			csfc->imp = imp;
+		}
+	}
 }
 
 static void surface_damage(struct wl_client *client,
@@ -266,6 +274,13 @@ static void surface_commit(struct wl_client *client,
 			csfc->glsyncobj_tex =
 				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 			csfc->status[csfc->current_tex_index] = TEX_WRITING;
+		} else if (csfc->imp != NULL) {
+			struct imported_egl_tex *imp = csfc->imp;
+			csfc->img_w = imp->width;
+                        csfc->img_h = imp->height;
+                        csfc->texid[csfc->current_tex_index] = imp->tex;
+                        csfc->glsyncobj_tex = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                        csfc->status[csfc->current_tex_index] = TEX_WRITING;
 		} else {
 			eglQueryWaylandBufferWL(egl_get_display(),
 						csfc->wl_buffer, EGL_WIDTH,
@@ -1410,6 +1425,7 @@ int main(int argc, char *argv[])
                          xdg_shell_bind);
         wl_global_create(wl_dpy, &wl_subcompositor_interface, 1, NULL,
                          bind_subcompositor);
+        linux_dmabuf_setup(compositor);
         wl_display_init_shm(wl_dpy);
 
         struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);

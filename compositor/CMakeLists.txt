@@ -45,7 +45,9 @@ add_executable(rvgpu-wlproxy
 	../common/winsys/${WINSYS_SRC}.c
         ../third_party/wayland/protocols/wayland-protocol.c
 	../third_party/wayland/protocols/xdg-shell-protocol.c
-        wayland_seat.c
+	../third_party/wayland/protocols/linux-dmabuf-unstable-v1-protocol.c
+	wayland_seat.c
+	linux-dma.c
 	main.c
 	)
 target_include_directories(rvgpu-wlproxy
