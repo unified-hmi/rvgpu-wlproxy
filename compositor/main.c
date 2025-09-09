@@ -569,6 +569,43 @@ static void compositor_bind(struct wl_client *client, void *data,
 }
 
 /*--------------------------------------------------------------------------- *
+ *  wl_subcompositor
+ *--------------------------------------------------------------------------- */
+
+static void
+subcompositor_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+        DLOG("%s\n", __FUNCTION__);
+        wl_resource_destroy(resource);
+}
+
+static void
+get_subsurface(struct wl_client *client,
+               struct wl_resource *resource,
+               uint32_t id,
+               struct wl_resource * surface)
+{
+        DLOG("%s\n", __FUNCTION__);
+}
+
+static const struct wl_subcompositor_interface subcompositor_interface = {
+    .destroy = subcompositor_destroy,
+    .get_subsurface = get_subsurface,
+};
+
+void
+bind_subcompositor(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    struct wl_resource *resource = wl_resource_create(client, &wl_subcompositor_interface, version, id);
+    if (!resource) {
+	    wl_client_post_no_memory(client);
+	    return;
+    }
+
+    wl_resource_set_implementation(resource, &subcompositor_interface, data, NULL);
+}
+
+/*--------------------------------------------------------------------------- *
  *  wl_output
  *--------------------------------------------------------------------------- */
 
@@ -1371,6 +1408,8 @@ int main(int argc, char *argv[])
                          wl_shell_bind);
         wl_global_create(wl_dpy, &xdg_wm_base_interface, 1, compositor,
                          xdg_shell_bind);
+        wl_global_create(wl_dpy, &wl_subcompositor_interface, 1, NULL,
+                         bind_subcompositor);
         wl_display_init_shm(wl_dpy);
 
         struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);
