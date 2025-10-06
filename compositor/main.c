@@ -598,7 +598,8 @@ static void
 get_subsurface(struct wl_client *client,
                struct wl_resource *resource,
                uint32_t id,
-               struct wl_resource * surface)
+               struct wl_resource * surface,
+               struct wl_resource *parent)
 {
         DLOG("%s\n", __FUNCTION__);
 }

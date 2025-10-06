@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include <unistd.h>
+#include <string.h>
 #include <wayland-server-protocol.h>
 #include <linux-dmabuf-unstable-v1-server-protocol.h>
 #include <drm/drm_fourcc.h>
