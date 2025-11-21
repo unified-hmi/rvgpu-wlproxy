@@ -86,12 +86,14 @@ static void surface_attach(struct wl_client *client,
 {
 	DLOG("%s\n", __FUNCTION__);
 	compositor_surface *csfc = wl_resource_get_user_data(resource);
-	csfc->wl_buffer = buffer_resource;
+	csfc->pending_wl_buffer[csfc->current_tex_index] = buffer_resource;
 	if (csfc->compositor->sfc_bind_zwp_linux_dmabuf_v1) {
-		struct linux_dmabuf_buffer *dmabuf = wl_resource_get_user_data(buffer_resource);
+		struct linux_dmabuf_buffer *dmabuf =
+			wl_resource_get_user_data(buffer_resource);
 		if (dmabuf != NULL) {
-			struct imported_egl_tex *imp = (struct imported_egl_tex *)dmabuf->user_data;
-			csfc->imp = imp;
+			struct imported_egl_tex *imp =
+				(struct imported_egl_tex *)dmabuf->user_data;
+			csfc->imp[csfc->current_tex_index] = imp;
 		}
 	}
 }
@@ -206,7 +208,7 @@ static void surface_commit(struct wl_client *client,
 	int vsub = 1;
 	compositor_surface *csfc = wl_resource_get_user_data(resource);
 
-	if (csfc->wl_buffer &&
+	if (csfc->pending_wl_buffer[csfc->current_tex_index] &&
 	    csfc->status[csfc->current_tex_index] == TEX_FREE) {
 		for (int i = 0; i < TEX_PLANE_NUM; i++) {
 			if (csfc->texid[i] == 0) {
@@ -227,9 +229,10 @@ static void surface_commit(struct wl_client *client,
 			}
 		}
 
-		struct wl_shm_buffer *shm_buf =
-			wl_shm_buffer_get(csfc->wl_buffer);
+		struct wl_shm_buffer *shm_buf = wl_shm_buffer_get(
+			csfc->pending_wl_buffer[csfc->current_tex_index]);
 		if (shm_buf) {
+			wl_shm_buffer_begin_access(shm_buf);
 			csfc->img_w = wl_shm_buffer_get_width(shm_buf);
 			csfc->img_h = wl_shm_buffer_get_height(shm_buf);
 			void *pixdata = wl_shm_buffer_get_data(shm_buf);
@@ -260,7 +263,9 @@ static void surface_commit(struct wl_client *client,
 			switch (gl_internal_format[0]) {
 			case GL_R8_EXT:
 				gl_format = GL_RED_EXT;
+				break;
 			case GL_RG8_EXT:
+				break;
 				gl_format = GL_RG_EXT;
 			default:
 				gl_format = gl_internal_format[0];
@@ -271,50 +276,63 @@ static void surface_commit(struct wl_client *client,
 				     pitch / hsub, csfc->img_h, 0, gl_format,
 				     gl_pixel_type, pixdata + offset);
 			glBindTexture(GL_TEXTURE_2D, 0);
-			csfc->glsyncobj_tex =
-				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+			wl_shm_buffer_end_access(shm_buf);
 			csfc->status[csfc->current_tex_index] = TEX_WRITING;
-		} else if (csfc->imp != NULL) {
-			struct imported_egl_tex *imp = csfc->imp;
+			csfc->pending_glsyncobj_tex[csfc->current_tex_index] =
+				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+			csfc->pending_tex_indexes[csfc->current_tex_index] = 1;
+		} else if (csfc->imp[csfc->current_tex_index] != NULL) {
+			struct imported_egl_tex *imp =
+				csfc->imp[csfc->current_tex_index];
 			csfc->img_w = imp->width;
-                        csfc->img_h = imp->height;
-                        csfc->texid[csfc->current_tex_index] = imp->tex;
-                        csfc->glsyncobj_tex = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                        csfc->status[csfc->current_tex_index] = TEX_WRITING;
+			csfc->img_h = imp->height;
+			csfc->texid[csfc->current_tex_index] = imp->tex;
+			csfc->status[csfc->current_tex_index] = TEX_WRITING;
+			csfc->pending_glsyncobj_tex[csfc->current_tex_index] =
+				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+			csfc->pending_tex_indexes[csfc->current_tex_index] = 1;
 		} else {
-			eglQueryWaylandBufferWL(egl_get_display(),
-						csfc->wl_buffer, EGL_WIDTH,
-						&csfc->img_w);
-			eglQueryWaylandBufferWL(egl_get_display(),
-						csfc->wl_buffer, EGL_HEIGHT,
-						&csfc->img_h);
+			eglQueryWaylandBufferWL(
+				egl_get_display(),
+				csfc->pending_wl_buffer[csfc->current_tex_index],
+				EGL_WIDTH, &csfc->img_w);
+			eglQueryWaylandBufferWL(
+				egl_get_display(),
+				csfc->pending_wl_buffer[csfc->current_tex_index],
+				EGL_HEIGHT, &csfc->img_h);
 
-			if (csfc->eglImg != EGL_NO_IMAGE_KHR) {
-				eglDestroyImageKHR(egl_get_display(),
-						   csfc->eglImg);
-				csfc->eglImg = EGL_NO_IMAGE_KHR;
+			if (csfc->eglImg[csfc->current_tex_index] !=
+			    EGL_NO_IMAGE_KHR) {
+				eglDestroyImageKHR(
+					egl_get_display(),
+					csfc->eglImg[csfc->current_tex_index]);
+				csfc->eglImg[csfc->current_tex_index] =
+					EGL_NO_IMAGE_KHR;
 			}
 			EGLint attribs = EGL_NONE;
-			csfc->eglImg =
-				eglCreateImageKHR(egl_get_display(),
-						  EGL_NO_CONTEXT,
-						  EGL_WAYLAND_BUFFER_WL,
-						  csfc->wl_buffer, &attribs);
+			csfc->eglImg[csfc->current_tex_index] = eglCreateImageKHR(
+				egl_get_display(), EGL_NO_CONTEXT,
+				EGL_WAYLAND_BUFFER_WL,
+				csfc->pending_wl_buffer[csfc->current_tex_index],
+				&attribs);
 
 			glBindTexture(GL_TEXTURE_2D,
 				      csfc->texid[csfc->current_tex_index]);
-			glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,
-						     csfc->eglImg);
+			glEGLImageTargetTexture2DOES(
+				GL_TEXTURE_2D,
+				csfc->eglImg[csfc->current_tex_index]);
 			glBindTexture(GL_TEXTURE_2D, 0);
-			csfc->glsyncobj_tex =
-				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 			csfc->status[csfc->current_tex_index] = TEX_WRITING;
+			csfc->pending_glsyncobj_tex[csfc->current_tex_index] =
+				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+			csfc->pending_tex_indexes[csfc->current_tex_index] = 1;
 		}
-	}
-	{
-		wl_list_insert_list(&csfc->frame_callback_list,
-				    &csfc->pending_frame_callback_list);
+		wl_list_insert_list(
+			&csfc->frame_callback_list[csfc->current_tex_index],
+			&csfc->pending_frame_callback_list);
 		wl_list_init(&csfc->pending_frame_callback_list);
+		csfc->current_tex_index =
+			(csfc->current_tex_index + 1) % TEX_PLANE_NUM;
 	}
 
 	shell_surface *shell_surface = csfc->shell_surface;
@@ -419,16 +437,17 @@ compositor_surface *compositor_surface_create(compositor *compositor)
 
 	csfc->pointer_focused = false;
 	csfc->keyboard_focused = false;
-	csfc->eglImg = EGL_NO_IMAGE_KHR;
 	for (int i = 0; i < TEX_PLANE_NUM; i++) {
 		csfc->status[i] = TEX_FREE;
+		csfc->pending_wl_buffer[i] = NULL;
+		csfc->pending_glsyncobj_tex[i] = NULL;
+		csfc->pending_tex_indexes[i] = 0;
+		csfc->eglImg[i] = EGL_NO_IMAGE_KHR;
+		wl_list_init(&csfc->frame_callback_list[i]);
 	}
-	csfc->glsyncobj_tex = NULL;
 	csfc->current_tex_index = 0;
-	csfc->updated_tex_index = -1;
 	wl_list_init(&csfc->link);
 	wl_list_init(&csfc->pending_frame_callback_list);
-	wl_list_init(&csfc->frame_callback_list);
 
 	return csfc;
 }
@@ -436,10 +455,10 @@ compositor_surface *compositor_surface_create(compositor *compositor)
 void compositor_surface_destroy(compositor_surface *csfc)
 {
 	DLOG("%s\n", __FUNCTION__);
-	if (csfc->eglImg != EGL_NO_IMAGE_KHR)
-		eglDestroyImageKHR(egl_get_display(), csfc->eglImg);
-
 	for (int i = 0; i < TEX_PLANE_NUM; i++) {
+		if (csfc->eglImg[i] != EGL_NO_IMAGE_KHR) {
+			eglDestroyImageKHR(egl_get_display(), csfc->eglImg[i]);
+		}
 		if (csfc->texid[i] != 0) {
 			glDeleteTextures(1, &csfc->texid[i]);
 		}
@@ -587,38 +606,38 @@ static void compositor_bind(struct wl_client *client, void *data,
  *  wl_subcompositor
  *--------------------------------------------------------------------------- */
 
-static void
-subcompositor_destroy(struct wl_client *client, struct wl_resource *resource)
+static void subcompositor_destroy(struct wl_client *client,
+				  struct wl_resource *resource)
 {
-        DLOG("%s\n", __FUNCTION__);
-        wl_resource_destroy(resource);
+	DLOG("%s\n", __FUNCTION__);
+	wl_resource_destroy(resource);
 }
 
-static void
-get_subsurface(struct wl_client *client,
-               struct wl_resource *resource,
-               uint32_t id,
-               struct wl_resource * surface,
-               struct wl_resource *parent)
+static void get_subsurface(struct wl_client *client,
+			   struct wl_resource *resource, uint32_t id,
+			   struct wl_resource *surface,
+			   struct wl_resource *parent)
 {
-        DLOG("%s\n", __FUNCTION__);
+	DLOG("%s\n", __FUNCTION__);
 }
 
 static const struct wl_subcompositor_interface subcompositor_interface = {
-    .destroy = subcompositor_destroy,
-    .get_subsurface = get_subsurface,
+	.destroy = subcompositor_destroy,
+	.get_subsurface = get_subsurface,
 };
 
-void
-bind_subcompositor(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+void bind_subcompositor(struct wl_client *client, void *data, uint32_t version,
+			uint32_t id)
 {
-    struct wl_resource *resource = wl_resource_create(client, &wl_subcompositor_interface, version, id);
-    if (!resource) {
-	    wl_client_post_no_memory(client);
-	    return;
-    }
+	struct wl_resource *resource = wl_resource_create(
+		client, &wl_subcompositor_interface, version, id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
 
-    wl_resource_set_implementation(resource, &subcompositor_interface, data, NULL);
+	wl_resource_set_implementation(resource, &subcompositor_interface, data,
+				       NULL);
 }
 
 /*--------------------------------------------------------------------------- *
@@ -1271,8 +1290,12 @@ bool has_writting_tex(compositor *compositor)
 	compositor_surface *csfc;
 	wl_list_for_each(csfc, &compositor->surface_list, link)
 	{
-		if (csfc->status[csfc->current_tex_index] == TEX_WRITING) {
-			has_wrtting_tex = true;
+		for (int i = 0; i < TEX_PLANE_NUM; i++) {
+			if (csfc->pending_tex_indexes[i] == 1) {
+				if (csfc->status[i] == TEX_WRITING) {
+					has_wrtting_tex = true;
+				}
+			}
 		}
 	}
 	return has_wrtting_tex;
@@ -1284,56 +1307,72 @@ bool has_updated_tex(compositor *compositor)
 	bool has_updated_tex = false;
 	wl_list_for_each(csfc, &compositor->surface_list, link)
 	{
-		if (csfc->status[csfc->current_tex_index] == TEX_WRITING) {
-			GLenum result =
-				glClientWaitSync(csfc->glsyncobj_tex,
-						 GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-			if (result == GL_ALREADY_SIGNALED) {
-				glDeleteSync(csfc->glsyncobj_tex);
-				csfc->glsyncobj_tex = NULL;
-				csfc->updated_tex_index =
-					csfc->current_tex_index;
-				csfc->current_tex_index =
-					(csfc->current_tex_index + 1) % 2;
-				csfc->status[csfc->current_tex_index] =
-					TEX_FREE;
-				csfc->status[csfc->updated_tex_index] =
-					TEX_COMPLETE;
-				has_updated_tex = true;
-
-				pthread_mutex_lock(
-					&csfc->compositor->event_mutex);
-				if (csfc->wl_used_buffer != NULL) {
-					wl_buffer_send_release(
-						csfc->wl_used_buffer);
-				}
-				csfc->wl_used_buffer = csfc->wl_buffer;
-
-				if (!wl_list_empty(
-					    &csfc->frame_callback_list)) {
-					compositor_frame_callback *cb, *cnext;
-					struct wl_list frame_callback_list;
-					wl_list_init(&frame_callback_list);
-					wl_list_insert_list(
-						&frame_callback_list,
-						&csfc->frame_callback_list);
-					wl_list_init(
-						&csfc->frame_callback_list);
-					uint32_t frame_time_msec =
-						getCurrentTimeMs();
-					wl_list_for_each_safe(
-						cb, cnext, &frame_callback_list,
-						link)
-					{
-						wl_callback_send_done(
-							cb->resource,
-							frame_time_msec);
-						wl_resource_destroy(
-							cb->resource);
+		for (int i = 0; i < TEX_PLANE_NUM; i++) {
+			if (csfc->pending_tex_indexes[i] == 1 &&
+			    csfc->status[i] == TEX_WRITING) {
+				GLenum result = glClientWaitSync(
+					csfc->pending_glsyncobj_tex[i],
+					GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+				if (result == GL_ALREADY_SIGNALED ||
+				    result == GL_CONDITION_SATISFIED) {
+					glDeleteSync(
+						csfc->pending_glsyncobj_tex[i]);
+					csfc->pending_glsyncobj_tex[i] = NULL;
+					for (int j = 0; j < TEX_PLANE_NUM;
+					     j++) {
+						if (csfc->status[j] ==
+						    TEX_COMPLETE) {
+							csfc->status[j] =
+								TEX_FREE;
+						}
 					}
+					csfc->status[i] = TEX_COMPLETE;
+					has_updated_tex = true;
+
+					pthread_mutex_lock(
+						&csfc->compositor->event_mutex);
+					if (csfc->pending_wl_buffer[i] !=
+					    NULL) {
+						wl_buffer_send_release(
+							csfc->pending_wl_buffer
+								[i]);
+						csfc->pending_tex_indexes[i] =
+							0;
+					}
+
+					if (!wl_list_empty(
+						    &csfc->frame_callback_list
+							     [i])) {
+						compositor_frame_callback *cb,
+							*cnext;
+						struct wl_list
+							frame_callback_list;
+						wl_list_init(
+							&frame_callback_list);
+						wl_list_insert_list(
+							&frame_callback_list,
+							&csfc->frame_callback_list
+								 [i]);
+						wl_list_init(
+							&csfc->frame_callback_list
+								 [i]);
+						uint32_t frame_time_msec =
+							getCurrentTimeMs();
+						wl_list_for_each_safe(
+							cb, cnext,
+							&frame_callback_list,
+							link)
+						{
+							wl_callback_send_done(
+								cb->resource,
+								frame_time_msec);
+							wl_resource_destroy(
+								cb->resource);
+						}
+					}
+					pthread_mutex_unlock(
+						&csfc->compositor->event_mutex);
 				}
-				pthread_mutex_unlock(
-					&csfc->compositor->event_mutex);
 			}
 		}
 	}
@@ -1347,10 +1386,16 @@ int update_surfaces(compositor *compositor, bool vsync)
 	glClear(GL_COLOR_BUFFER_BIT);
 	wl_list_for_each(csfc, &compositor->surface_list, link)
 	{
-		if (csfc->status[csfc->updated_tex_index] == TEX_COMPLETE) {
-			ret = draw_2d_texture(
-				csfc->texid[csfc->updated_tex_index], 0, 0,
-				csfc->img_w, csfc->img_h, 0);
+		int latest_tex_index = -1;
+		for (int i = 0; i < TEX_PLANE_NUM; i++) {
+			if (csfc->status[i] == TEX_COMPLETE) {
+				latest_tex_index = i;
+				break;
+			}
+		}
+		if (latest_tex_index != -1) {
+			ret = draw_2d_texture(csfc->texid[latest_tex_index], 0,
+					      0, csfc->img_w, csfc->img_h, 0);
 			if (ret == -1)
 				return ret;
 		}
@@ -1388,7 +1433,8 @@ int main(int argc, char *argv[])
 	if (ret == -1)
 		return 0;
 
-	ret = egl_init_with_platform_window_surface(2, 0, 0, 0, &win_w, &win_h, windowed);
+	ret = egl_init_with_platform_window_surface(2, 0, 0, 0, &win_w, &win_h,
+						    windowed);
 	if (ret == -1)
 		goto out;
 	ret = egl_set_swap_interval(vsync);
@@ -1407,31 +1453,31 @@ int main(int argc, char *argv[])
 	if (ret == -1)
 		goto out;
 
-        compositor *compositor = calloc(sizeof(*compositor), 1);
-        compositor->wl_display = wl_dpy;
-        compositor->width = win_w;
-        compositor->height = win_h;
-        compositor->sfc_fullscreen = sfc_fullscreen;
-        pthread_mutex_init(&compositor->event_mutex, NULL);
-        wl_list_init(&compositor->surface_list);
-        wl_list_init(&compositor->client_list);
+	compositor *compositor = calloc(sizeof(*compositor), 1);
+	compositor->wl_display = wl_dpy;
+	compositor->width = win_w;
+	compositor->height = win_h;
+	compositor->sfc_fullscreen = sfc_fullscreen;
+	pthread_mutex_init(&compositor->event_mutex, NULL);
+	wl_list_init(&compositor->surface_list);
+	wl_list_init(&compositor->client_list);
 
-        wl_global_create(wl_dpy, &wl_compositor_interface, 4, compositor,
-                         compositor_bind);
-        wl_global_create(wl_dpy, &wl_output_interface, 3, compositor,
-                         output_bind);
-        wl_global_create(wl_dpy, &wl_shell_interface, 1, compositor,
-                         wl_shell_bind);
-        wl_global_create(wl_dpy, &xdg_wm_base_interface, 1, compositor,
-                         xdg_shell_bind);
-        wl_global_create(wl_dpy, &wl_subcompositor_interface, 1, NULL,
-                         bind_subcompositor);
-        linux_dmabuf_setup(compositor);
-        wl_display_init_shm(wl_dpy);
+	wl_global_create(wl_dpy, &wl_compositor_interface, 4, compositor,
+			 compositor_bind);
+	wl_global_create(wl_dpy, &wl_output_interface, 3, compositor,
+			 output_bind);
+	wl_global_create(wl_dpy, &wl_shell_interface, 1, compositor,
+			 wl_shell_bind);
+	wl_global_create(wl_dpy, &xdg_wm_base_interface, 1, compositor,
+			 xdg_shell_bind);
+	wl_global_create(wl_dpy, &wl_subcompositor_interface, 1, NULL,
+			 bind_subcompositor);
+	linux_dmabuf_setup(compositor);
+	wl_display_init_shm(wl_dpy);
 
-        struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);
-        wl_event_loop_add_signal(eloop, SIGINT, handle_signal, compositor);
-        wl_event_loop_add_signal(eloop, SIGTERM, handle_signal, compositor);
+	struct wl_event_loop *eloop = wl_display_get_event_loop(wl_dpy);
+	wl_event_loop_add_signal(eloop, SIGINT, handle_signal, compositor);
+	wl_event_loop_add_signal(eloop, SIGTERM, handle_signal, compositor);
 
 	init_2d_renderer(win_w, win_h);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);

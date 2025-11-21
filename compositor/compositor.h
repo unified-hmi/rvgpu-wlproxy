@@ -23,7 +23,7 @@
 #include <GLES2/gl2.h>
 #include <pthread.h>
 
-#define TEX_PLANE_NUM 2
+#define TEX_PLANE_NUM 3
 
 struct xkb_info {
 	struct xkb_keymap *keymap;
@@ -83,17 +83,16 @@ typedef struct compositor_surface {
 	compositor *compositor;
 	struct shell_surface *shell_surface;
 	struct wl_list pending_frame_callback_list;
-	struct wl_list frame_callback_list;
+	struct wl_list frame_callback_list[TEX_PLANE_NUM];
 
-	struct wl_resource *wl_buffer;
-	struct wl_resource *wl_used_buffer;
-	EGLImageKHR eglImg;
-	GLuint texid[2];
-	int status[2];
-	GLsync glsyncobj_tex;
-	struct imported_egl_tex *imp;
+	struct wl_resource *pending_wl_buffer[TEX_PLANE_NUM];
+	EGLImageKHR eglImg[TEX_PLANE_NUM];
+	GLuint texid[TEX_PLANE_NUM];
+	int status[TEX_PLANE_NUM];
+	GLsync pending_glsyncobj_tex[TEX_PLANE_NUM];
+	struct imported_egl_tex *imp[TEX_PLANE_NUM];
 	int current_tex_index;
-	int updated_tex_index;
+	int pending_tex_indexes[TEX_PLANE_NUM];
 	int img_w; /* shm_buffer width      */
 	int img_h; /* shm_buffer height     */
 	bool pointer_focused;
