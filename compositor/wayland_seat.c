@@ -388,6 +388,78 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version,
 /*--------------------------------------------------------------------------- *
  *  Event handler
  *--------------------------------------------------------------------------- */
+static void sendq_push(struct compositor *c, struct send_evt *ev)
+{
+	pthread_mutex_lock(&c->sendq_mutex);
+	wl_list_insert(c->sendq.prev, &ev->link);
+	pthread_mutex_unlock(&c->sendq_mutex);
+
+	uint64_t one = 1;
+	(void)write(c->send_efd, &one, sizeof one);
+}
+
+void compositor_post_pointer_enter(struct compositor *c,
+			  struct wl_resource *ptr_res,
+			  struct wl_display *display,
+			  struct wl_resource *surface_res,
+			  wl_fixed_t x, wl_fixed_t y)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_PTR_ENTER;
+	ev->res = ptr_res;
+	ev->display = display;
+	ev->surface_res = surface_res;
+	ev->x = x;
+	ev->y = y;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_pointer_leave(struct compositor *c,
+			  struct wl_resource *ptr_res,
+			  struct wl_display *display,
+			  struct wl_resource *surface_res)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_PTR_LEAVE;
+	ev->res = ptr_res;
+	ev->display = display;
+	ev->surface_res = surface_res;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_pointer_motion(struct compositor *c,
+			  struct wl_resource *ptr_res,
+			  uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_PTR_MOTION;
+	ev->res = ptr_res;
+	ev->time = time;
+	ev->x = x;
+	ev->y = y;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_pointer_frame(struct compositor *c,
+			  struct wl_resource *ptr_res)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_PTR_FRAME;
+	ev->res = ptr_res;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
 
 static void mousemove_cb(int x, int y)
 {
@@ -419,26 +491,50 @@ static void mousemove_cb(int x, int y)
 	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
 	bool pointer_in_surface =
 		check_pointer_enter_surface(focused_csfc->resource, x, y);
+
 	if (!focused_csfc->pointer_focused && pointer_in_surface) {
-		wl_pointer_send_enter(resource, serial, focused_csfc->resource,
-				      fix_x, fix_y);
+		compositor_post_pointer_enter(focused_csfc->compositor, resource,
+				focused_csfc->compositor->wl_display,
+				focused_csfc->resource, fix_x, fix_y);
 		focused_csfc->pointer_focused = true;
 	}
 
 	if (focused_csfc->pointer_focused && (x == -1 || y == -1)) {
-		wl_pointer_send_leave(resource, serial, focused_csfc->resource);
+		compositor_post_pointer_leave(focused_csfc->compositor, resource,
+				focused_csfc->compositor->wl_display,
+				focused_csfc->resource);
 		focused_csfc->pointer_focused = false;
 	}
 
 	if (focused_csfc->pointer_focused && pointer_in_surface) {
-		wl_pointer_send_motion(resource, msecs, fix_x, fix_y);
+		compositor_post_pointer_motion(focused_csfc->compositor, resource,
+				msecs, fix_x, fix_y);
 		if (wl_resource_get_version(resource) >=
 		    WL_POINTER_FRAME_SINCE_VERSION) {
-			wl_pointer_send_frame(resource);
+			compositor_post_pointer_frame(focused_csfc->compositor, resource);
 		}
 	}
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
+
 	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
+}
+
+
+void compositor_post_pointer_button(struct compositor *c,
+			  struct wl_resource *ptr_res,
+			  struct wl_display *display,
+			  uint32_t time,
+			  uint32_t button, uint32_t state)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_PTR_BUTTON;
+	ev->res = ptr_res;
+	ev->display = display;
+	ev->time = time; ev->button = button;
+	ev->state = state;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
 }
 
 static void button_cb(int button, int state, int x, int y)
@@ -466,10 +562,95 @@ static void button_cb(int button, int state, int x, int y)
 	DLOG("button_cb %d, %d, %d, %d, %d, %d\n", serial, msecs, button, state,
 	     x, y);
 	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
-	wl_pointer_send_button(resource, serial, msecs, button, state);
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
+
+	compositor_post_pointer_button(focused_csfc->compositor, resource,
+			focused_csfc->compositor->wl_display,  msecs, button, state);
 	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
 }
+
+
+void compositor_post_keyboard_keymap(struct compositor *c,
+			  struct wl_resource *kbd_res,
+			  uint32_t format, int fd, uint32_t size)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	int dfd = dup(fd);
+	if (dfd < 0) { free(ev); return; }
+	ev->type = SEND_KBD_KEYMAP;
+	ev->res = kbd_res;
+	ev->keymap_format = format;
+	ev->keymap_fd = dfd;
+	ev->keymap_size = size;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_keyboard_enter(struct compositor *c,
+			  struct wl_resource *kbd_res,
+			  struct wl_display *display,
+			  struct wl_resource *surface_res,
+			  const struct wl_array *keys) // nullable
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_KBD_ENTER;
+	ev->res = kbd_res;
+	ev->display = display;
+	ev->surface_res = surface_res;
+	wl_array_init(&ev->keys);
+	if (keys && keys->size) {
+		void *data = malloc(keys->size);
+		if (data) {
+			memcpy(data, keys->data, keys->size);
+			ev->keys.data = data;
+			ev->keys.size = keys->size;
+		}
+	}
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_keyboard_modifiers(struct compositor *c,
+			  struct wl_resource *kbd_res,
+			  struct wl_display *display,
+			  uint32_t depressed, uint32_t latched,
+			  uint32_t locked, uint32_t group)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_KBD_MODS;
+	ev->res = kbd_res;
+	ev->display = display;
+	ev->mods_depressed = depressed;
+	ev->mods_latched   = latched;
+	ev->mods_locked    = locked;
+	ev->group          = group;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_keyboard_key(struct compositor *c,
+			  struct wl_resource *kbd_res,
+			  struct wl_display *display,
+			  uint32_t time, uint32_t key, uint32_t state)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_KBD_KEY;
+	ev->res = kbd_res;
+	ev->display = display;
+	ev->time = time;
+	ev->key = key;
+	ev->state = state;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
 
 void keyboard_cb(int key, int state)
 {
@@ -493,23 +674,21 @@ void keyboard_cb(int key, int state)
 
 	if (!focused_csfc->keyboard_focused) {
 		pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
-		wl_keyboard_send_keymap(
-			resource, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+		compositor_post_keyboard_keymap(focused_csfc->compositor, resource,
+			WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
 			focused_csfc->compositor->xkb_info->fd,
 			focused_csfc->compositor->xkb_info->size);
-		uint32_t serial = wl_display_next_serial(
-			focused_csfc->compositor->wl_display);
+
 		struct wl_array keys;
 		wl_array_init(&keys);
-		wl_keyboard_send_enter(resource, serial, focused_csfc->resource,
-				       &keys);
+		compositor_post_keyboard_enter(focused_csfc->compositor, resource,
+				focused_csfc->compositor->wl_display,
+				focused_csfc->resource, &keys);
 		wl_array_release(&keys);
 		focused_csfc->keyboard_focused = true;
 		pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
 	}
 
-	uint32_t serial =
-		wl_display_next_serial(focused_csfc->compositor->wl_display);
 	uint32_t msecs = getCurrentTimeMs();
 
 	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
@@ -533,8 +712,11 @@ void keyboard_cb(int key, int state)
 	    mods_latched != focused_csfc->compositor->modifiers.mods_latched ||
 	    mods_locked != focused_csfc->compositor->modifiers.mods_locked ||
 	    group != focused_csfc->compositor->modifiers.group) {
-		wl_keyboard_send_modifiers(resource, serial, mods_depressed,
-					   mods_latched, mods_locked, group);
+
+		compositor_post_keyboard_modifiers(focused_csfc->compositor, resource,
+				focused_csfc->compositor->wl_display,
+				mods_depressed, mods_latched, mods_locked, group);
+
 		focused_csfc->compositor->modifiers.mods_depressed =
 			mods_depressed;
 		focused_csfc->compositor->modifiers.mods_latched = mods_latched;
@@ -543,12 +725,50 @@ void keyboard_cb(int key, int state)
 	}
 
 	DLOG("keyboard_cb key: %d, state: %d\n", key, state);
-	wl_keyboard_send_key(resource, serial, msecs, key, state);
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
+
+	compositor_post_keyboard_key(focused_csfc->compositor, resource,
+			focused_csfc->compositor->wl_display, msecs, key, state);
+
 	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
 }
 
 #if defined(USE_TOUCH)
+void compositor_post_touch_frame(struct compositor *c,
+			  struct wl_resource *touch_res)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_TOUCH_FRAME;
+	ev->res = touch_res;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+void compositor_post_touch_down(struct compositor *c,
+			  struct wl_resource *tch_res,
+			  struct wl_display *display,
+			  uint32_t time,
+			  struct wl_resource *surface_res,
+			  int32_t id,
+			  wl_fixed_t x, wl_fixed_t y)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_TOUCH_DOWN;
+	ev->res = tch_res;
+	ev->display = display;
+	ev->time = time;
+	ev->id = id;
+	ev->surface_res = surface_res;
+	ev->x = x;
+	ev->y = y;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+
 static void touch_down_cb(int32_t id, int32_t x, int32_t y)
 {
 	if (focused_csfc == NULL)
@@ -572,16 +792,31 @@ static void touch_down_cb(int32_t id, int32_t x, int32_t y)
 	wl_fixed_t fix_x = wl_fixed_from_int(x);
 	wl_fixed_t fix_y = wl_fixed_from_int(y);
 
-	uint32_t serial =
-		wl_display_next_serial(focused_csfc->compositor->wl_display);
-
-	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
-	wl_touch_send_down(resource, serial, 0, focused_csfc->resource, id,
-			   fix_x, fix_y);
-	wl_touch_send_frame(resource);
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
-	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
+	compositor_post_touch_down(focused_csfc->compositor, resource,
+			focused_csfc->compositor->wl_display, 0,
+			focused_csfc->resource, id, fix_x, fix_y);
+	compositor_post_touch_frame(focused_csfc->compositor, resource);
 }
+
+
+void compositor_post_touch_up(struct compositor *c,
+			  struct wl_resource *tch_res,
+			  struct wl_display *display,
+			  uint32_t time, int32_t id)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_TOUCH_UP;
+	ev->res = tch_res;
+	ev->display = display;
+	ev->time = time;
+	ev->id = id;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
+
 
 static void touch_up_cb(int32_t id)
 {
@@ -602,15 +837,30 @@ static void touch_up_cb(int32_t id)
 	if (resource == NULL) {
 		return;
 	}
-	uint32_t serial =
-		wl_display_next_serial(focused_csfc->compositor->wl_display);
 	uint32_t time = getCurrentTimeMs();
 
-	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
-	wl_touch_send_up(resource, serial, time, id);
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
-	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
+	compositor_post_touch_up(focused_csfc->compositor, resource,
+			focused_csfc->compositor->wl_display, time, id);
 }
+
+void compositor_post_touch_motion(struct compositor *c,
+			  struct wl_resource *touch_res,
+			  uint32_t time, int32_t id,
+			  wl_fixed_t x, wl_fixed_t y)
+{
+	struct send_evt *ev = calloc(1, sizeof *ev);
+	if (!ev) return;
+	ev->type = SEND_TOUCH_MOTION;
+	ev->time = time;
+	ev->id = id;
+	ev->x = x;
+	ev->y = y;
+	ev->res = touch_res;
+
+	wl_list_init(&ev->link);
+	sendq_push(c, ev);
+}
+
 
 static void touch_motion_cb(int32_t id, int32_t x, int32_t y)
 {
@@ -635,11 +885,9 @@ static void touch_motion_cb(int32_t id, int32_t x, int32_t y)
 	wl_fixed_t fix_x = wl_fixed_from_int(x);
 	wl_fixed_t fix_y = wl_fixed_from_int(y);
 
-	pthread_mutex_lock(&focused_csfc->compositor->event_mutex);
-	wl_touch_send_motion(resource, 0, id, fix_x, fix_y);
-	wl_touch_send_frame(resource);
-	wl_display_flush_clients(focused_csfc->compositor->wl_display);
-	pthread_mutex_unlock(&focused_csfc->compositor->event_mutex);
+	compositor_post_touch_motion(focused_csfc->compositor, resource,
+		0, id, fix_x, fix_y);
+	compositor_post_touch_frame(focused_csfc->compositor, resource);
 }
 #endif
 

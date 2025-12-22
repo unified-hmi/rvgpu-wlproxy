@@ -23,6 +23,9 @@
 #include <GLES2/gl2.h>
 #include <pthread.h>
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #define TEX_PLANE_NUM 3
 
 struct xkb_info {
@@ -52,6 +55,53 @@ typedef struct {
 	struct wl_listener destroy_listener;
 } client_data;
 
+enum send_type {
+	SEND_PTR_ENTER,
+	SEND_PTR_LEAVE,
+	SEND_PTR_MOTION,
+	SEND_PTR_BUTTON,
+	SEND_PTR_FRAME,
+
+	SEND_KBD_ENTER,
+	SEND_KBD_MODS,
+	SEND_KBD_KEY,
+	SEND_KBD_KEYMAP,
+
+	SEND_TOUCH_DOWN,
+	SEND_TOUCH_UP,
+	SEND_TOUCH_MOTION,
+	SEND_TOUCH_FRAME
+};
+
+struct send_evt {
+	struct wl_list link;
+	enum send_type type;
+
+	struct wl_display *display;
+
+	struct wl_resource *res;
+	struct wl_resource *surface_res;
+
+	uint32_t time;
+	wl_fixed_t x, y;
+	int32_t id;
+
+	uint32_t button;
+	uint32_t state;
+	uint32_t key;
+
+	uint32_t mods_depressed;
+	uint32_t mods_latched;
+	uint32_t mods_locked;
+	uint32_t group;
+
+	struct wl_array keys;
+
+	uint32_t keymap_format;
+	int keymap_fd;
+	uint32_t keymap_size;
+};
+
 typedef struct compositor {
 	struct wl_resource *resource;
 	struct wl_display *wl_display;
@@ -73,6 +123,12 @@ typedef struct compositor {
 	struct xkb_rule_names xkb_names;
 	struct xkb_context *xkb_context;
 	struct xkb_info *xkb_info;
+
+	/*add send ev*/
+	int send_efd;
+	pthread_mutex_t sendq_mutex;
+	struct wl_list sendq;
+
 } compositor;
 
 /* wl_compositor_create_surface() */

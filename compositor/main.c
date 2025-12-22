@@ -1284,6 +1284,100 @@ static appopt_t parse_opt(int argc, char *argv[])
 	return appopt;
 }
 
+static int sendq_on_fd(int fd, uint32_t mask, void *data)
+{
+	struct compositor *c = data;
+	uint64_t cnt;
+	if (read(fd, &cnt, sizeof cnt) < 0) return 0;
+
+	for (;;) {
+		struct send_evt *ev;
+		pthread_mutex_lock(&c->sendq_mutex);
+		if (wl_list_empty(&c->sendq)) {
+			pthread_mutex_unlock(&c->sendq_mutex);
+			break;
+		}
+		ev = wl_container_of(c->sendq.next, ev, link);
+		wl_list_remove(&ev->link);
+		pthread_mutex_unlock(&c->sendq_mutex);
+
+		switch (ev->type) {
+		case SEND_PTR_ENTER:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_pointer_send_enter(ev->res, serial, ev->surface_res, ev->x, ev->y);
+			break;
+		}
+		case SEND_PTR_LEAVE:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_pointer_send_leave(ev->res, serial, ev->surface_res);
+			break;
+		}
+		case SEND_PTR_MOTION:
+			wl_pointer_send_motion(ev->res, ev->time, ev->x, ev->y);
+			break;
+		case SEND_PTR_BUTTON:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_pointer_send_button(ev->res, serial, ev->time, ev->button, ev->state);
+			break;
+		}
+		case SEND_PTR_FRAME:
+			wl_pointer_send_frame(ev->res);
+			break;
+		case SEND_KBD_ENTER:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			struct wl_array empty; wl_array_init(&empty);
+			struct wl_array *keys = (ev->keys.size ? &ev->keys : &empty);
+			wl_keyboard_send_enter(ev->res, serial, ev->surface_res, keys);
+			if (ev->keys.size && ev->keys.data) {
+				free(ev->keys.data);
+			}
+			break;
+		}
+		case SEND_KBD_MODS:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_keyboard_send_modifiers(ev->res, serial, ev->mods_depressed, ev->mods_latched, ev->mods_locked, ev->group);
+			break;
+		}
+		case SEND_KBD_KEY:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_keyboard_send_key(ev->res, serial, ev->time, ev->key, ev->state);
+			break;
+		}
+		case SEND_KBD_KEYMAP:
+			wl_keyboard_send_keymap(ev->res, ev->keymap_format, ev->keymap_fd, ev->keymap_size);
+			close(ev->keymap_fd);
+			break;
+
+		case SEND_TOUCH_DOWN:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_touch_send_down(ev->res, serial, ev->time, ev->surface_res, ev->id, ev->x, ev->y);
+			break;
+		}
+		case SEND_TOUCH_UP:
+		{
+			uint32_t serial = wl_display_next_serial(ev->display ? ev->display : c->wl_display);
+			wl_touch_send_up(ev->res, serial, ev->time, ev->id);
+			break;
+		}
+		case SEND_TOUCH_MOTION:
+			wl_touch_send_motion(ev->res, ev->time, ev->id, ev->x, ev->y);
+			break;
+		case SEND_TOUCH_FRAME:
+			wl_touch_send_frame(ev->res);
+			break;
+		}
+		free(ev);
+	}
+	return 0;
+}
+
 bool has_writting_tex(compositor *compositor)
 {
 	bool has_wrtting_tex = false;
@@ -1479,6 +1573,11 @@ int main(int argc, char *argv[])
 	wl_event_loop_add_signal(eloop, SIGINT, handle_signal, compositor);
 	wl_event_loop_add_signal(eloop, SIGTERM, handle_signal, compositor);
 
+	pthread_mutex_init(&compositor->sendq_mutex, NULL);
+	wl_list_init(&compositor->sendq);
+	compositor->send_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	wl_event_loop_add_fd(eloop, compositor->send_efd, WL_EVENT_READABLE, sendq_on_fd, compositor);
+
 	init_2d_renderer(win_w, win_h);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	compositor_seat_init(compositor);
@@ -1510,24 +1609,23 @@ int main(int argc, char *argv[])
 
 	int pre_csfc_num = 0;
 	for (int count = 0;; count++) {
+
 		pthread_mutex_lock(&compositor->event_mutex);
 		wl_display_flush_clients(wl_dpy);
 		pthread_mutex_unlock(&compositor->event_mutex);
-		wl_event_loop_dispatch(eloop, -1);
 
-		bool need_update_tex_draw = has_writting_tex(compositor);
-		if (need_update_tex_draw) {
-			while (has_writting_tex(compositor)) {
-				if (has_updated_tex(compositor)) {
-					ret = update_surfaces(compositor,
-							      vsync);
-				} else {
-					usleep(100);
-				}
+		bool writing = has_writting_tex(compositor);
+		int timeout = writing ? 0 : -1;
+		wl_event_loop_dispatch(eloop, timeout);
+
+		if (writing) {
+			if (has_updated_tex(compositor)) {
+				ret = update_surfaces(compositor,vsync);
+			} else {
+				usleep(100);
 			}
 		} else {
-			int csfc_num =
-				wl_list_length(&compositor->surface_list);
+			int csfc_num = wl_list_length(&compositor->surface_list);
 			if (csfc_num != pre_csfc_num) {
 				ret = update_surfaces(compositor, vsync);
 				pre_csfc_num = csfc_num;
