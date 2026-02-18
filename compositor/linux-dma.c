@@ -16,7 +16,13 @@
  */
 
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <wayland-server-protocol.h>
 #include <linux-dmabuf-unstable-v1-server-protocol.h>
 #include <drm/drm_fourcc.h>
@@ -27,6 +33,17 @@
 #include "util_log.h"
 #include "compositor.h"
 #include "linux-dma.h"
+
+/* EGL device query extension constants */
+#ifndef EGL_DEVICE_EXT
+#define EGL_DEVICE_EXT 0x322C
+#endif
+#ifndef EGL_DRM_DEVICE_FILE_EXT
+#define EGL_DRM_DEVICE_FILE_EXT 0x3233
+#endif
+#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
+#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#endif
 
 extern PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
 extern PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
@@ -493,6 +510,156 @@ zwp_linux_buffer_params_implementation = {
         params_create_immed
 };
 
+/*
+ * zwp_linux_dmabuf_feedback_v1 implementation for version 4+
+ */
+
+/* Format table entry: format (4 bytes) + padding (4 bytes) + modifier (8 bytes) */
+struct dmabuf_format_table_entry {
+        uint32_t format;
+        uint32_t padding;
+        uint64_t modifier;
+};
+
+/* Supported formats for feedback */
+static const struct dmabuf_format_table_entry supported_formats[] = {
+        { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+        { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+        { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_INVALID },
+        { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_INVALID },
+};
+
+#define NUM_SUPPORTED_FORMATS (sizeof(supported_formats) / sizeof(supported_formats[0]))
+
+static void
+linux_dmabuf_feedback_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+        DLOG("%s\n", __FUNCTION__);
+        wl_resource_destroy(resource);
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_interface
+zwp_linux_dmabuf_feedback_implementation = {
+        linux_dmabuf_feedback_destroy
+};
+
+static PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttribEXT;
+static PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT;
+
+static void
+send_feedback_events(struct wl_resource *feedback_resource)
+{
+        int fd = -1;
+        size_t size;
+        void *map;
+        struct wl_array arr;
+        dev_t dev;
+        struct stat statbuf;
+        const char *drm_dev = NULL;
+        char render_node_path[32];
+
+        /* Get DRM device from EGL (cache proc addresses) */
+        EGLDisplay dpy = egl_get_display();
+        if (dpy != EGL_NO_DISPLAY) {
+                if (!eglQueryDisplayAttribEXT)
+                        eglQueryDisplayAttribEXT = (void *)eglGetProcAddress("eglQueryDisplayAttribEXT");
+                if (!eglQueryDeviceStringEXT)
+                        eglQueryDeviceStringEXT = (void *)eglGetProcAddress("eglQueryDeviceStringEXT");
+                EGLAttrib egl_device;
+                if (eglQueryDisplayAttribEXT && eglQueryDeviceStringEXT &&
+                    eglQueryDisplayAttribEXT(dpy, EGL_DEVICE_EXT, &egl_device)) {
+                        drm_dev = eglQueryDeviceStringEXT((EGLDeviceEXT)egl_device,
+                                                         EGL_DRM_RENDER_NODE_FILE_EXT);
+                        if (!drm_dev)
+                                drm_dev = eglQueryDeviceStringEXT((EGLDeviceEXT)egl_device,
+                                                                  EGL_DRM_DEVICE_FILE_EXT);
+                }
+        }
+
+        /* Fallback for winsys_drm: derive render node from card device */
+        if (!drm_dev) {
+                const char *card_dev = getenv("EGLWINSYS_DRM_DEV_NAME");
+                if (card_dev && stat(card_dev, &statbuf) == 0) {
+                        snprintf(render_node_path, sizeof(render_node_path),
+                                 "/dev/dri/renderD%d", 128 + minor(statbuf.st_rdev));
+                        drm_dev = render_node_path;
+                }
+        }
+
+        if (!drm_dev || stat(drm_dev, &statbuf) < 0)
+                return;
+        dev = statbuf.st_rdev;
+
+        /* Create format table */
+        size = NUM_SUPPORTED_FORMATS * sizeof(struct dmabuf_format_table_entry);
+        fd = memfd_create("dmabuf-format-table", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, size) < 0)
+                goto done;
+        map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED)
+                goto done;
+        memcpy(map, supported_formats, size);
+        munmap(map, size);
+
+        /* Send feedback events */
+        zwp_linux_dmabuf_feedback_v1_send_format_table(feedback_resource, fd, (uint32_t)size);
+
+        wl_array_init(&arr);
+        *(dev_t *)wl_array_add(&arr, sizeof(dev_t)) = dev;
+        zwp_linux_dmabuf_feedback_v1_send_main_device(feedback_resource, &arr);
+        zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback_resource, &arr);
+        wl_array_release(&arr);
+
+        wl_array_init(&arr);
+        for (uint32_t i = 0; i < NUM_SUPPORTED_FORMATS; i++)
+                *(uint16_t *)wl_array_add(&arr, sizeof(uint16_t)) = i;
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback_resource, &arr);
+        wl_array_release(&arr);
+
+        zwp_linux_dmabuf_feedback_v1_send_tranche_flags(feedback_resource, 0);
+        zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback_resource);
+        zwp_linux_dmabuf_feedback_v1_send_done(feedback_resource);
+
+done:
+        if (fd >= 0)
+                close(fd);
+}
+
+static void
+linux_dmabuf_get_default_feedback(struct wl_client *client,
+                                  struct wl_resource *resource,
+                                  uint32_t id)
+{
+        DLOG("%s\n", __FUNCTION__);
+        struct wl_resource *feedback_resource;
+
+        feedback_resource = wl_resource_create(client,
+                                               &zwp_linux_dmabuf_feedback_v1_interface,
+                                               wl_resource_get_version(resource),
+                                               id);
+        if (!feedback_resource) {
+                wl_resource_post_no_memory(resource);
+                return;
+        }
+
+        wl_resource_set_implementation(feedback_resource,
+                                       &zwp_linux_dmabuf_feedback_implementation,
+                                       NULL, NULL);
+
+        send_feedback_events(feedback_resource);
+}
+
+static void
+linux_dmabuf_get_surface_feedback(struct wl_client *client,
+                                  struct wl_resource *resource,
+                                  uint32_t id,
+                                  struct wl_resource *surface)
+{
+        DLOG("%s\n", __FUNCTION__);
+        /* For per-surface feedback, we use the same feedback as default */
+        linux_dmabuf_get_default_feedback(client, resource, id);
+}
+
 static void
 linux_dmabuf_destroy(struct wl_client *client, struct wl_resource *resource)
 {
@@ -559,7 +726,9 @@ err_out:
 
 static const struct zwp_linux_dmabuf_v1_interface linux_dmabuf_implementation = {
         linux_dmabuf_destroy,
-        linux_dmabuf_create_params
+        linux_dmabuf_create_params,
+        linux_dmabuf_get_default_feedback,
+        linux_dmabuf_get_surface_feedback
 };
 
 static void
@@ -569,9 +738,6 @@ bind_linux_dmabuf(struct wl_client *client,
 	DLOG("%s\n", __FUNCTION__);
         compositor *compositor = data;
         struct wl_resource *resource;
-        const uint64_t *modifiers;
-        unsigned int num_modifiers;
-        unsigned int i;
 
 	compositor->sfc_bind_zwp_linux_dmabuf_v1 = true;
         resource = wl_resource_create(client, &zwp_linux_dmabuf_v1_interface,
@@ -583,16 +749,28 @@ bind_linux_dmabuf(struct wl_client *client,
         wl_resource_set_implementation(resource, &linux_dmabuf_implementation,
                                        compositor, NULL);
 
-        const uint32_t fmt = DRM_FORMAT_ARGB8888;
-        const uint64_t mod = DRM_FORMAT_MOD_LINEAR;
-        zwp_linux_dmabuf_v1_send_format(resource, fmt);
+        /* For version 3+, send modifier events */
+        if (version >= ZWP_LINUX_DMABUF_V1_MODIFIER_SINCE_VERSION) {
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ARGB8888,
+                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
+                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ARGB8888,
+                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
+                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
+        } else {
+                /* For version 1-2, send format events */
+                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_ARGB8888);
+                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_XRGB8888);
+        }
 }
 
 int
 linux_dmabuf_setup(compositor *compositor)
 {
         if (!wl_global_create(compositor->wl_display,
-                              &zwp_linux_dmabuf_v1_interface, 1,
+                              &zwp_linux_dmabuf_v1_interface, 4,
                               compositor, bind_linux_dmabuf))
                 return -1;
 
