@@ -38,7 +38,7 @@
 
 #define UNUSED(x) (void)(x)
 
-static int s_drm_fd;
+static int s_drm_fd = -1;
 struct gbm_device *s_gbm;
 struct gbm_surface *s_gbm_sfc;
 modeset_dev_t *modeset_list = NULL;
