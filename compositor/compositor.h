@@ -153,6 +153,18 @@ typedef struct compositor_surface {
 	int img_h; /* shm_buffer height     */
 	bool pointer_focused;
 	bool keyboard_focused;
+
+	/* Damage tracking: bounding box of pending damage */
+	bool has_damage;
+	int32_t damage_x, damage_y, damage_w, damage_h;
+	bool tex_initialized[TEX_PLANE_NUM]; /* true after first full upload */
+
+	/* Frame callback: send only after egl_swap for updated surfaces */
+	bool needs_frame_callback;
+
+	/* SHM pixel diff: previous frame buffer for actual damage detection */
+	uint8_t *prev_shm_data[TEX_PLANE_NUM];
+	int prev_shm_w, prev_shm_h, prev_shm_stride;
 } compositor_surface;
 
 typedef struct compositor_region {
