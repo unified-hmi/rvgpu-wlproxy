@@ -42,6 +42,50 @@ uint32_t getCurrentTimeMs(void);
 
 typedef enum { TEX_FREE, TEX_WRITING, TEX_COMPLETE } TexStatus;
 
+/*
+ * SHM pixel diff: compare current SHM buffer with previous frame
+ * to find the bounding box of actually-changed pixels.
+ * Returns true if any difference found, with damage rect in out params.
+ */
+static bool shm_pixel_diff(const uint8_t *cur, const uint8_t *prev,
+			    int w, int h, int stride,
+			    int32_t *out_x, int32_t *out_y,
+			    int32_t *out_w, int32_t *out_h)
+{
+	int first_row = -1, last_row = -1;
+	int first_col = w, last_col = 0;
+	int bpp = stride / w;
+
+	/* Scan rows to find first and last changed rows */
+	for (int y = 0; y < h; y++) {
+		const uint8_t *cur_row = cur + y * stride;
+		const uint8_t *prev_row = prev + y * stride;
+		if (memcmp(cur_row, prev_row, w * bpp) != 0) {
+			if (first_row < 0)
+				first_row = y;
+			last_row = y;
+			/* Find column bounds within this row */
+			for (int x = 0; x < w; x++) {
+				if (memcmp(cur_row + x * bpp, prev_row + x * bpp, bpp) != 0) {
+					if (x < first_col)
+						first_col = x;
+					if (x > last_col)
+						last_col = x;
+				}
+			}
+		}
+	}
+
+	if (first_row < 0)
+		return false; /* No change */
+
+	*out_x = first_col;
+	*out_y = first_row;
+	*out_w = last_col - first_col + 1;
+	*out_h = last_row - first_row + 1;
+	return true;
+}
+
 compositor_surface *focused_csfc = NULL;
 
 compositor_surface *get_top_compositor_surface(compositor *compositor)
@@ -102,7 +146,25 @@ static void surface_damage(struct wl_client *client,
 			   struct wl_resource *resource, int32_t x, int32_t y,
 			   int32_t width, int32_t height)
 {
-	DLOG("%s\n", __FUNCTION__);
+	DLOG("%s x=%d y=%d w=%d h=%d\n", __FUNCTION__, x, y, width, height);
+	compositor_surface *csfc = wl_resource_get_user_data(resource);
+	if (!csfc->has_damage) {
+		csfc->damage_x = x;
+		csfc->damage_y = y;
+		csfc->damage_w = width;
+		csfc->damage_h = height;
+		csfc->has_damage = true;
+	} else {
+		/* Expand bounding box to union of old and new */
+		int32_t x2 = csfc->damage_x + csfc->damage_w;
+		int32_t y2 = csfc->damage_y + csfc->damage_h;
+		int32_t nx2 = x + width;
+		int32_t ny2 = y + height;
+		csfc->damage_x = (x < csfc->damage_x) ? x : csfc->damage_x;
+		csfc->damage_y = (y < csfc->damage_y) ? y : csfc->damage_y;
+		csfc->damage_w = ((nx2 > x2) ? nx2 : x2) - csfc->damage_x;
+		csfc->damage_h = ((ny2 > y2) ? ny2 : y2) - csfc->damage_y;
+	}
 }
 
 static void destroy_frame_callback(struct wl_resource *resource)
@@ -232,6 +294,9 @@ static void surface_commit(struct wl_client *client,
 		struct wl_shm_buffer *shm_buf = wl_shm_buffer_get(
 			csfc->pending_wl_buffer[csfc->current_tex_index]);
 		if (shm_buf) {
+			DLOG("%s: SHM path (w=%d h=%d)\n", __FUNCTION__,
+			     wl_shm_buffer_get_width(shm_buf),
+			     wl_shm_buffer_get_height(shm_buf));
 			wl_shm_buffer_begin_access(shm_buf);
 			csfc->img_w = wl_shm_buffer_get_width(shm_buf);
 			csfc->img_h = wl_shm_buffer_get_height(shm_buf);
@@ -272,9 +337,78 @@ static void surface_commit(struct wl_client *client,
 			}
 			glBindTexture(GL_TEXTURE_2D,
 				      csfc->texid[csfc->current_tex_index]);
-			glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format[0],
-				     pitch / hsub, csfc->img_h, 0, gl_format,
-				     gl_pixel_type, pixdata + offset);
+			int tex_w = pitch / hsub;
+			int tex_h = csfc->img_h;
+			int stride = wl_shm_buffer_get_stride(shm_buf);
+
+			if (!csfc->tex_initialized[csfc->current_tex_index]) {
+				/* First upload: full texture */
+				glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format[0],
+					     tex_w, tex_h, 0, gl_format,
+					     gl_pixel_type, pixdata + offset);
+				csfc->tex_initialized[csfc->current_tex_index] = true;
+			} else {
+				/* Subsequent upload: use pixel diff against THIS texture's
+				 * previous content to find actual damage */
+				int ti = csfc->current_tex_index;
+				int32_t dx, dy, dw, dh;
+				bool has_real_damage = false;
+				int data_size = stride * tex_h;
+
+				if (csfc->prev_shm_data[ti] &&
+				    csfc->prev_shm_w == tex_w &&
+				    csfc->prev_shm_h == tex_h &&
+				    csfc->prev_shm_stride == stride) {
+					has_real_damage = shm_pixel_diff(
+						(const uint8_t *)pixdata + offset,
+						csfc->prev_shm_data[ti],
+						tex_w, tex_h, stride,
+						&dx, &dy, &dw, &dh);
+				} else {
+					/* Size changed or no prev data: full upload */
+					dx = 0; dy = 0; dw = tex_w; dh = tex_h;
+					has_real_damage = true;
+					/* Reallocate prev buffer for this plane */
+					free(csfc->prev_shm_data[ti]);
+					csfc->prev_shm_data[ti] = malloc(data_size);
+				}
+
+				if (has_real_damage && dw > 0 && dh > 0) {
+					int bpp = stride / tex_w;
+					DLOG("%s: pixel diff actual damage (%d,%d %dx%d) vs client (%d,%d %dx%d)\n",
+					     __FUNCTION__, dx, dy, dw, dh,
+					     csfc->damage_x, csfc->damage_y,
+					     csfc->damage_w, csfc->damage_h);
+					glPixelStorei(GL_UNPACK_ROW_LENGTH, tex_w);
+					void *sub_data = (char *)pixdata + offset +
+							  dy * stride + dx * bpp;
+					glTexSubImage2D(GL_TEXTURE_2D, 0,
+							dx, dy, dw, dh,
+							gl_format, gl_pixel_type,
+							sub_data);
+					glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+				}
+				/* else: no change from this texture's perspective, skip */
+			}
+
+			/* Save current frame for THIS texture plane's next diff */
+			{
+				int ti = csfc->current_tex_index;
+				int data_size = stride * tex_h;
+				if (!csfc->prev_shm_data[ti]) {
+					csfc->prev_shm_data[ti] = malloc(data_size);
+				}
+				if (csfc->prev_shm_data[ti]) {
+					memcpy(csfc->prev_shm_data[ti],
+					       (const uint8_t *)pixdata + offset,
+					       data_size);
+					csfc->prev_shm_w = tex_w;
+					csfc->prev_shm_h = tex_h;
+					csfc->prev_shm_stride = stride;
+				}
+			}
+
+			csfc->has_damage = false;
 			glBindTexture(GL_TEXTURE_2D, 0);
 			wl_shm_buffer_end_access(shm_buf);
 			csfc->status[csfc->current_tex_index] = TEX_WRITING;
@@ -284,6 +418,8 @@ static void surface_commit(struct wl_client *client,
 		} else if (csfc->imp[csfc->current_tex_index] != NULL) {
 			struct imported_egl_tex *imp =
 				csfc->imp[csfc->current_tex_index];
+			DLOG("%s: dmabuf imported path (w=%d h=%d)\n",
+			     __FUNCTION__, imp->width, imp->height);
 			csfc->img_w = imp->width;
 			csfc->img_h = imp->height;
 			csfc->texid[csfc->current_tex_index] = imp->tex;
@@ -300,6 +436,8 @@ static void surface_commit(struct wl_client *client,
 				egl_get_display(),
 				csfc->pending_wl_buffer[csfc->current_tex_index],
 				EGL_HEIGHT, &csfc->img_h);
+			DLOG("%s: EGLImage path (w=%d h=%d)\n",
+			     __FUNCTION__, csfc->img_w, csfc->img_h);
 
 			if (csfc->eglImg[csfc->current_tex_index] !=
 			    EGL_NO_IMAGE_KHR) {
@@ -382,7 +520,10 @@ static void surface_damage_buffer(struct wl_client *client,
 				  struct wl_resource *resource, int32_t x,
 				  int32_t y, int32_t width, int32_t height)
 {
-	DLOG("%s\n", __FUNCTION__);
+	DLOG("%s x=%d y=%d w=%d h=%d\n", __FUNCTION__, x, y, width, height);
+	/* Buffer damage uses the same coordinate space as surface damage
+	 * when buffer_transform is normal and buffer_scale is 1 */
+	surface_damage(client, resource, x, y, width, height);
 }
 
 static const struct wl_surface_interface surface_interface = {
@@ -462,6 +603,7 @@ void compositor_surface_destroy(compositor_surface *csfc)
 		if (csfc->texid[i] != 0) {
 			glDeleteTextures(1, &csfc->texid[i]);
 		}
+		free(csfc->prev_shm_data[i]);
 	}
 
 	wl_list_remove(&csfc->link);
@@ -1422,6 +1564,7 @@ bool has_updated_tex(compositor *compositor)
 					}
 					csfc->status[i] = TEX_COMPLETE;
 					has_updated_tex = true;
+					csfc->needs_frame_callback = true;
 
 					pthread_mutex_lock(
 						&csfc->compositor->event_mutex);
@@ -1432,37 +1575,6 @@ bool has_updated_tex(compositor *compositor)
 								[i]);
 						csfc->pending_tex_indexes[i] =
 							0;
-					}
-
-					if (!wl_list_empty(
-						    &csfc->frame_callback_list
-							     [i])) {
-						compositor_frame_callback *cb,
-							*cnext;
-						struct wl_list
-							frame_callback_list;
-						wl_list_init(
-							&frame_callback_list);
-						wl_list_insert_list(
-							&frame_callback_list,
-							&csfc->frame_callback_list
-								 [i]);
-						wl_list_init(
-							&csfc->frame_callback_list
-								 [i]);
-						uint32_t frame_time_msec =
-							getCurrentTimeMs();
-						wl_list_for_each_safe(
-							cb, cnext,
-							&frame_callback_list,
-							link)
-						{
-							wl_callback_send_done(
-								cb->resource,
-								frame_time_msec);
-							wl_resource_destroy(
-								cb->resource);
-						}
 					}
 					pthread_mutex_unlock(
 						&csfc->compositor->event_mutex);
@@ -1494,7 +1606,40 @@ int update_surfaces(compositor *compositor, bool vsync)
 				return ret;
 		}
 	}
+
 	ret = egl_swap(vsync);
+
+	/* Send frame callbacks only for surfaces that were updated,
+	 * after egl_swap() so the content is actually displayed.
+	 * This matches Weston's behavior of delivering callbacks at
+	 * VBlank time, preventing unnecessary client redraws. */
+	pthread_mutex_lock(&compositor->event_mutex);
+	uint32_t frame_time_msec = getCurrentTimeMs();
+	wl_list_for_each(csfc, &compositor->surface_list, link)
+	{
+		if (!csfc->needs_frame_callback)
+			continue;
+		csfc->needs_frame_callback = false;
+		for (int i = 0; i < TEX_PLANE_NUM; i++) {
+			if (!wl_list_empty(&csfc->frame_callback_list[i])) {
+				compositor_frame_callback *cb, *cnext;
+				struct wl_list tmp_list;
+				wl_list_init(&tmp_list);
+				wl_list_insert_list(&tmp_list,
+						    &csfc->frame_callback_list[i]);
+				wl_list_init(&csfc->frame_callback_list[i]);
+				wl_list_for_each_safe(cb, cnext, &tmp_list, link)
+				{
+					wl_callback_send_done(cb->resource,
+							      frame_time_msec);
+					wl_resource_destroy(cb->resource);
+				}
+			}
+		}
+	}
+	wl_display_flush_clients(compositor->wl_display);
+	pthread_mutex_unlock(&compositor->event_mutex);
+
 	return ret;
 }
 
