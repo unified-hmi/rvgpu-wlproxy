@@ -306,12 +306,22 @@ static void surface_commit(struct wl_client *client,
 			switch (format) {
 			case WL_SHM_FORMAT_XRGB8888:
 				pitch = wl_shm_buffer_get_stride(shm_buf) / 4;
-				gl_internal_format[0] = GL_BGRA_EXT;
+				gl_internal_format[0] = GL_RGBA;
 				gl_pixel_type = GL_UNSIGNED_BYTE;
 				break;
 			case WL_SHM_FORMAT_ARGB8888:
 				pitch = wl_shm_buffer_get_stride(shm_buf) / 4;
-				gl_internal_format[0] = GL_BGRA_EXT;
+				gl_internal_format[0] = GL_RGBA;
+				gl_pixel_type = GL_UNSIGNED_BYTE;
+				break;
+			case WL_SHM_FORMAT_XBGR8888:
+				pitch = wl_shm_buffer_get_stride(shm_buf) / 4;
+				gl_internal_format[0] = GL_RGBA;
+				gl_pixel_type = GL_UNSIGNED_BYTE;
+				break;
+			case WL_SHM_FORMAT_ABGR8888:
+				pitch = wl_shm_buffer_get_stride(shm_buf) / 4;
+				gl_internal_format[0] = GL_RGBA;
 				gl_pixel_type = GL_UNSIGNED_BYTE;
 				break;
 			case WL_SHM_FORMAT_RGB565:

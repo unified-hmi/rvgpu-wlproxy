@@ -525,8 +525,12 @@ struct dmabuf_format_table_entry {
 static const struct dmabuf_format_table_entry supported_formats[] = {
         { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
         { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
+        { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_LINEAR },
+        { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_LINEAR },
         { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_INVALID },
         { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_INVALID },
+        { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_INVALID },
+        { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_INVALID },
 };
 
 #define NUM_SUPPORTED_FORMATS (sizeof(supported_formats) / sizeof(supported_formats[0]))
@@ -755,14 +759,24 @@ bind_linux_dmabuf(struct wl_client *client,
                         DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
                 zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
                         DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ABGR8888,
+                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XBGR8888,
+                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
                 zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ARGB8888,
                         DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
                 zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
+                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ABGR8888,
+                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
+                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XBGR8888,
                         DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
         } else {
                 /* For version 1-2, send format events */
                 zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_ARGB8888);
                 zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_XRGB8888);
+                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_ABGR8888);
+                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_XBGR8888);
         }
 }
 
