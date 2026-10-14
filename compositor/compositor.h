@@ -131,6 +131,15 @@ typedef struct compositor {
 
 } compositor;
 
+struct compositor_surface;
+
+typedef struct pending_buffer_listener {
+	struct wl_listener listener;
+	struct compositor_surface *csfc;
+	int slot;
+	bool added;
+} pending_buffer_listener;
+
 /* wl_compositor_create_surface() */
 typedef struct compositor_surface {
 	struct wl_resource *resource;
@@ -142,6 +151,7 @@ typedef struct compositor_surface {
 	struct wl_list frame_callback_list[TEX_PLANE_NUM];
 
 	struct wl_resource *pending_wl_buffer[TEX_PLANE_NUM];
+	pending_buffer_listener pending_wl_buffer_listener[TEX_PLANE_NUM];
 	EGLImageKHR eglImg[TEX_PLANE_NUM];
 	GLuint texid[TEX_PLANE_NUM];
 	int status[TEX_PLANE_NUM];
@@ -201,7 +211,10 @@ typedef struct shell_surface {
 	struct wl_resource *resource;
 	compositor_surface *csfc;
 	xdg_toplevel *toplevel;
+	unsigned int ref_count;
 	bool added;
+	/* false once the surface or its role object is gone; idle configures check it */
+	bool alive;
 } shell_surface;
 
 typedef struct compositor_frame_callback {

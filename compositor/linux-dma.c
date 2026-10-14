@@ -521,19 +521,152 @@ struct dmabuf_format_table_entry {
         uint64_t modifier;
 };
 
-/* Supported formats for feedback */
-static const struct dmabuf_format_table_entry supported_formats[] = {
-        { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_LINEAR },
-        { DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_INVALID },
-        { DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_INVALID },
-        { DRM_FORMAT_ABGR8888, 0, DRM_FORMAT_MOD_INVALID },
-        { DRM_FORMAT_XBGR8888, 0, DRM_FORMAT_MOD_INVALID },
+static const uint32_t dmabuf_fallback_formats[] = {
+        DRM_FORMAT_ARGB8888,
+        DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_ABGR8888,
+        DRM_FORMAT_XBGR8888,
 };
 
-#define NUM_SUPPORTED_FORMATS (sizeof(supported_formats) / sizeof(supported_formats[0]))
+#define NUM_FALLBACK_FORMATS \
+        (sizeof(dmabuf_fallback_formats) / sizeof(dmabuf_fallback_formats[0]))
+
+/* Formats queried from the host EGL; empty means use the fallback list */
+static uint32_t *dyn_dmabuf_formats;
+static uint32_t dyn_dmabuf_format_count;
+
+static PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
+static PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
+
+static bool is_fallback_format(uint32_t format)
+{
+        for (size_t i = 0; i < NUM_FALLBACK_FORMATS; i++)
+                if (dmabuf_fallback_formats[i] == format)
+                        return true;
+        return false;
+}
+
+/* Imports are bound to GL_TEXTURE_2D, so external-only formats (e.g. YUV) are unusable */
+static bool is_texture_2d_linear_importable(EGLDisplay dpy, uint32_t format)
+{
+        EGLint num_mods = 0;
+        EGLuint64KHR *mods;
+        EGLBoolean *external_only;
+        bool ok = false;
+
+        if (!eglQueryDmaBufModifiersEXT(dpy, (EGLint)format, 0, NULL, NULL,
+                                        &num_mods))
+                return false;
+        /* Driver gives no modifier info: only trust the known RGB formats */
+        if (num_mods <= 0)
+                return is_fallback_format(format);
+
+        mods = calloc((size_t)num_mods, sizeof(*mods));
+        external_only = calloc((size_t)num_mods, sizeof(*external_only));
+        if (mods && external_only &&
+            eglQueryDmaBufModifiersEXT(dpy, (EGLint)format, num_mods, mods,
+                                       external_only, &num_mods)) {
+                for (EGLint i = 0; i < num_mods; i++) {
+                        if (mods[i] == DRM_FORMAT_MOD_LINEAR &&
+                            !external_only[i]) {
+                                ok = true;
+                                break;
+                        }
+                }
+        }
+        free(mods);
+        free(external_only);
+        return ok;
+}
+
+static uint32_t query_supported_dmabuf_formats(EGLDisplay dpy,
+                                               uint32_t **out_formats)
+{
+        EGLint num_formats = 0;
+        EGLint *formats;
+        uint32_t *out;
+        uint32_t count = 0;
+
+        *out_formats = NULL;
+
+        EGL_GET_PROC_ADDR(eglQueryDmaBufFormatsEXT);
+        EGL_GET_PROC_ADDR(eglQueryDmaBufModifiersEXT);
+        if (!eglQueryDmaBufFormatsEXT || !eglQueryDmaBufModifiersEXT)
+                return 0;
+
+        if (!eglQueryDmaBufFormatsEXT(dpy, 0, NULL, &num_formats) ||
+            num_formats <= 0) {
+                WLOG("Failed to query host dma-buf format count\n");
+                return 0;
+        }
+
+        formats = calloc((size_t)num_formats, sizeof(*formats));
+        out = calloc((size_t)num_formats, sizeof(*out));
+        if (!formats || !out)
+                goto fail;
+
+        if (!eglQueryDmaBufFormatsEXT(dpy, num_formats, formats,
+                                      &num_formats)) {
+                WLOG("Failed to query host dma-buf formats\n");
+                goto fail;
+        }
+
+        for (EGLint i = 0; i < num_formats; i++) {
+                if (is_texture_2d_linear_importable(dpy, (uint32_t)formats[i]))
+                        out[count++] = (uint32_t)formats[i];
+        }
+        free(formats);
+
+        if (count == 0) {
+                free(out);
+                return 0;
+        }
+
+        ILOG("Host EGL reports %u usable dma-buf format(s)\n", count);
+        *out_formats = out;
+        return count;
+
+fail:
+        free(formats);
+        free(out);
+        return 0;
+}
+
+static const uint32_t *dmabuf_active_formats(uint32_t *count)
+{
+        if (dyn_dmabuf_format_count > 0) {
+                *count = dyn_dmabuf_format_count;
+                return dyn_dmabuf_formats;
+        }
+        *count = NUM_FALLBACK_FORMATS;
+        return dmabuf_fallback_formats;
+}
+
+/* Each format is advertised with both LINEAR and implicit (INVALID) modifiers */
+static struct dmabuf_format_table_entry *
+build_dmabuf_format_table(uint32_t *out_len)
+{
+        uint32_t n = 0;
+        const uint32_t *formats = dmabuf_active_formats(&n);
+        struct dmabuf_format_table_entry *table;
+        uint32_t count = 0;
+
+        *out_len = 0;
+        table = calloc(2 * (size_t)n, sizeof(*table));
+        if (!table)
+                return NULL;
+
+        for (uint32_t i = 0; i < n; i++)
+                table[count++] = (struct dmabuf_format_table_entry){
+                        formats[i], 0, DRM_FORMAT_MOD_LINEAR
+                };
+        for (uint32_t i = 0; i < n; i++)
+                table[count++] = (struct dmabuf_format_table_entry){
+                        formats[i], 0, DRM_FORMAT_MOD_INVALID
+                };
+        *out_len = count;
+        return table;
+}
 
 static void
 linux_dmabuf_feedback_destroy(struct wl_client *client, struct wl_resource *resource)
@@ -561,6 +694,8 @@ send_feedback_events(struct wl_resource *feedback_resource)
         struct stat statbuf;
         const char *drm_dev = NULL;
         char render_node_path[32];
+        struct dmabuf_format_table_entry *table = NULL;
+        uint32_t table_len = 0;
 
         /* Get DRM device from EGL (cache proc addresses) */
         EGLDisplay dpy = egl_get_display();
@@ -594,15 +729,19 @@ send_feedback_events(struct wl_resource *feedback_resource)
                 return;
         dev = statbuf.st_rdev;
 
+        table = build_dmabuf_format_table(&table_len);
+        if (!table)
+                return;
+
         /* Create format table */
-        size = NUM_SUPPORTED_FORMATS * sizeof(struct dmabuf_format_table_entry);
+        size = table_len * sizeof(struct dmabuf_format_table_entry);
         fd = memfd_create("dmabuf-format-table", MFD_CLOEXEC);
         if (fd < 0 || ftruncate(fd, size) < 0)
                 goto done;
         map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (map == MAP_FAILED)
                 goto done;
-        memcpy(map, supported_formats, size);
+        memcpy(map, table, size);
         munmap(map, size);
 
         /* Send feedback events */
@@ -615,7 +754,7 @@ send_feedback_events(struct wl_resource *feedback_resource)
         wl_array_release(&arr);
 
         wl_array_init(&arr);
-        for (uint32_t i = 0; i < NUM_SUPPORTED_FORMATS; i++)
+        for (uint32_t i = 0; i < table_len; i++)
                 *(uint16_t *)wl_array_add(&arr, sizeof(uint16_t)) = i;
         zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback_resource, &arr);
         wl_array_release(&arr);
@@ -625,6 +764,7 @@ send_feedback_events(struct wl_resource *feedback_resource)
         zwp_linux_dmabuf_feedback_v1_send_done(feedback_resource);
 
 done:
+        free(table);
         if (fd >= 0)
                 close(fd);
 }
@@ -753,36 +893,35 @@ bind_linux_dmabuf(struct wl_client *client,
         wl_resource_set_implementation(resource, &linux_dmabuf_implementation,
                                        compositor, NULL);
 
+        uint32_t n = 0;
+        const uint32_t *formats = dmabuf_active_formats(&n);
+
         /* For version 3+, send modifier events */
         if (version >= ZWP_LINUX_DMABUF_V1_MODIFIER_SINCE_VERSION) {
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ARGB8888,
-                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
-                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ABGR8888,
-                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XBGR8888,
-                        DRM_FORMAT_MOD_LINEAR >> 32, DRM_FORMAT_MOD_LINEAR & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ARGB8888,
-                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XRGB8888,
-                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_ABGR8888,
-                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
-                zwp_linux_dmabuf_v1_send_modifier(resource, DRM_FORMAT_XBGR8888,
-                        DRM_FORMAT_MOD_INVALID >> 32, DRM_FORMAT_MOD_INVALID & 0xffffffff);
+                for (uint32_t i = 0; i < n; i++) {
+                        zwp_linux_dmabuf_v1_send_modifier(resource, formats[i],
+                                DRM_FORMAT_MOD_LINEAR >> 32,
+                                DRM_FORMAT_MOD_LINEAR & 0xffffffff);
+                        zwp_linux_dmabuf_v1_send_modifier(resource, formats[i],
+                                DRM_FORMAT_MOD_INVALID >> 32,
+                                DRM_FORMAT_MOD_INVALID & 0xffffffff);
+                }
         } else {
                 /* For version 1-2, send format events */
-                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_ARGB8888);
-                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_XRGB8888);
-                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_ABGR8888);
-                zwp_linux_dmabuf_v1_send_format(resource, DRM_FORMAT_XBGR8888);
+                for (uint32_t i = 0; i < n; i++)
+                        zwp_linux_dmabuf_v1_send_format(resource, formats[i]);
         }
 }
 
 int
 linux_dmabuf_setup(compositor *compositor)
 {
+        EGLDisplay dpy = egl_get_display();
+
+        if (dpy != EGL_NO_DISPLAY && !dyn_dmabuf_formats)
+                dyn_dmabuf_format_count =
+                        query_supported_dmabuf_formats(dpy, &dyn_dmabuf_formats);
+
         if (!wl_global_create(compositor->wl_display,
                               &zwp_linux_dmabuf_v1_interface, 4,
                               compositor, bind_linux_dmabuf))
