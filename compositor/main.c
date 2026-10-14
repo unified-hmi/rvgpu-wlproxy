@@ -114,6 +114,32 @@ PFNEGLQUERYWAYLANDBUFFERWL eglQueryWaylandBufferWL;
 PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 
+static void shell_surface_ref(shell_surface *shell_surface)
+{
+	shell_surface->ref_count++;
+}
+
+static void shell_surface_unref(shell_surface *shell_surface)
+{
+	if (--shell_surface->ref_count == 0)
+		free(shell_surface);
+}
+
+static void shell_surface_detach_compositor_surface(
+	shell_surface *shell_surface)
+{
+	compositor_surface *csfc = shell_surface->csfc;
+
+	if (csfc == NULL)
+		return;
+	bool attached = csfc->shell_surface == shell_surface;
+	if (attached)
+		csfc->shell_surface = NULL;
+	shell_surface->csfc = NULL;
+	if (attached)
+		shell_surface_unref(shell_surface);
+}
+
 /*--------------------------------------------------------------------------- *
  *  wl_surface
  *--------------------------------------------------------------------------- */
@@ -123,6 +149,33 @@ static void surface_destroy(struct wl_client *client,
 	DLOG("%s\n", __FUNCTION__);
 }
 
+static void pending_wl_buffer_destroyed(struct wl_listener *listener,
+					void *data)
+{
+	pending_buffer_listener *pbl = wl_container_of(listener, pbl, listener);
+	compositor_surface *csfc = pbl->csfc;
+
+	if (csfc->pending_wl_buffer[pbl->slot] == data) {
+		csfc->pending_wl_buffer[pbl->slot] = NULL;
+		/* imp is owned by the dmabuf buffer and freed along with it */
+		csfc->imp[pbl->slot] = NULL;
+	}
+	/* Older libwayland leaves the node linked to the dying signal. */
+	wl_list_remove(&listener->link);
+	wl_list_init(&listener->link);
+	pbl->added = false;
+}
+
+static void pending_wl_buffer_untrack(compositor_surface *csfc, int slot)
+{
+	pending_buffer_listener *pbl = &csfc->pending_wl_buffer_listener[slot];
+
+	if (pbl->added) {
+		wl_list_remove(&pbl->listener.link);
+		pbl->added = false;
+	}
+}
+
 static void surface_attach(struct wl_client *client,
 			   struct wl_resource *resource,
 			   struct wl_resource *buffer_resource, int32_t sx,
@@ -130,7 +183,22 @@ static void surface_attach(struct wl_client *client,
 {
 	DLOG("%s\n", __FUNCTION__);
 	compositor_surface *csfc = wl_resource_get_user_data(resource);
-	csfc->pending_wl_buffer[csfc->current_tex_index] = buffer_resource;
+	int slot = csfc->current_tex_index;
+	pending_buffer_listener *pbl = &csfc->pending_wl_buffer_listener[slot];
+
+	pending_wl_buffer_untrack(csfc, slot);
+	csfc->pending_wl_buffer[slot] = buffer_resource;
+	if (buffer_resource == NULL) {
+		csfc->imp[slot] = NULL;
+		return;
+	}
+
+	pbl->csfc = csfc;
+	pbl->slot = slot;
+	pbl->listener.notify = pending_wl_buffer_destroyed;
+	wl_resource_add_destroy_listener(buffer_resource, &pbl->listener);
+	pbl->added = true;
+
 	if (csfc->compositor->sfc_bind_zwp_linux_dmabuf_v1) {
 		struct linux_dmabuf_buffer *dmabuf =
 			wl_resource_get_user_data(buffer_resource);
@@ -221,6 +289,11 @@ static void xdg_send_configure_event(void *user_data)
 {
 	DLOG("%s\n", __FUNCTION__);
 	shell_surface *shell_surface = user_data;
+
+	if (!shell_surface->alive || shell_surface->csfc == NULL ||
+	    shell_surface->resource == NULL || shell_surface->toplevel == NULL)
+		return;
+
 	xdg_toplevel *toplevel = shell_surface->toplevel;
 
 	uint32_t *s;
@@ -256,6 +329,36 @@ static void xdg_send_configure_event(void *user_data)
 		shell_surface->csfc->compositor->wl_display);
 	xdg_surface_send_configure(shell_surface->resource, serial);
 	pthread_mutex_unlock(&shell_surface->csfc->compositor->event_mutex);
+}
+
+struct configure_idle {
+	shell_surface *shell_surface;
+};
+
+static void xdg_send_configure_idle(void *user_data)
+{
+	struct configure_idle *idle = user_data;
+
+	xdg_send_configure_event(idle->shell_surface);
+	shell_surface_unref(idle->shell_surface);
+	free(idle);
+}
+
+static void schedule_xdg_configure(struct wl_event_loop *loop,
+				   shell_surface *shell_surface)
+{
+	struct configure_idle *idle = malloc(sizeof(*idle));
+	if (idle == NULL) {
+		ELOG("%s: failed to allocate configure callback\n", __FUNCTION__);
+		return;
+	}
+
+	idle->shell_surface = shell_surface;
+	shell_surface_ref(shell_surface);
+	if (wl_event_loop_add_idle(loop, xdg_send_configure_idle, idle) == NULL) {
+		shell_surface_unref(shell_surface);
+		free(idle);
+	}
 }
 
 static void surface_commit(struct wl_client *client,
@@ -426,17 +529,26 @@ static void surface_commit(struct wl_client *client,
 				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 			csfc->pending_tex_indexes[csfc->current_tex_index] = 1;
 		} else if (csfc->imp[csfc->current_tex_index] != NULL) {
-			struct imported_egl_tex *imp =
-				csfc->imp[csfc->current_tex_index];
+			int ti = csfc->current_tex_index;
+			struct imported_egl_tex *imp = csfc->imp[ti];
 			DLOG("%s: dmabuf imported path (w=%d h=%d)\n",
 			     __FUNCTION__, imp->width, imp->height);
 			csfc->img_w = imp->width;
 			csfc->img_h = imp->height;
-			csfc->texid[csfc->current_tex_index] = imp->tex;
-			csfc->status[csfc->current_tex_index] = TEX_WRITING;
-			csfc->pending_glsyncobj_tex[csfc->current_tex_index] =
+
+			if (csfc->eglImg[ti] != EGL_NO_IMAGE_KHR) {
+				eglDestroyImageKHR(egl_get_display(),
+						   csfc->eglImg[ti]);
+				csfc->eglImg[ti] = EGL_NO_IMAGE_KHR;
+			}
+			/* Slot texture stays valid after the wl_buffer destroys imp->image. */
+			glBindTexture(GL_TEXTURE_2D, csfc->texid[ti]);
+			glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, imp->image);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			csfc->status[ti] = TEX_WRITING;
+			csfc->pending_glsyncobj_tex[ti] =
 				glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-			csfc->pending_tex_indexes[csfc->current_tex_index] = 1;
+			csfc->pending_tex_indexes[ti] = 1;
 		} else {
 			eglQueryWaylandBufferWL(
 				egl_get_display(),
@@ -484,31 +596,22 @@ static void surface_commit(struct wl_client *client,
 	}
 
 	shell_surface *shell_surface = csfc->shell_surface;
-	if (shell_surface) {
-		if (shell_surface->added == 0 && shell_surface->toplevel) {
-			struct wl_display *display =
-				csfc->compositor->wl_display;
-			struct wl_event_loop *loop =
-				wl_display_get_event_loop(display);
+	if (shell_surface && shell_surface->alive &&
+	    shell_surface->added == 0 && shell_surface->toplevel) {
+		struct wl_display *display = csfc->compositor->wl_display;
+		struct wl_event_loop *loop = wl_display_get_event_loop(display);
 
-			if (shell_surface->csfc->compositor->sfc_fullscreen) {
-				shell_surface->toplevel->pending.state
-					.fullscreen = true;
-				int width =
-					shell_surface->csfc->compositor->width;
-				int height =
-					shell_surface->csfc->compositor->height;
-				shell_surface->toplevel->pending.size.width =
-					width;
-				shell_surface->toplevel->pending.size.height =
-					height;
-			}
-
-			shell_surface->toplevel->pending.state.activated = true;
-			wl_event_loop_add_idle(loop, xdg_send_configure_event,
-					       shell_surface);
-			shell_surface->added = true;
+		if (csfc->compositor->sfc_fullscreen) {
+			shell_surface->toplevel->pending.state.fullscreen = true;
+			shell_surface->toplevel->pending.size.width =
+				csfc->compositor->width;
+			shell_surface->toplevel->pending.size.height =
+				csfc->compositor->height;
 		}
+
+		shell_surface->toplevel->pending.state.activated = true;
+		schedule_xdg_configure(loop, shell_surface);
+		shell_surface->added = true;
 	}
 }
 
@@ -606,6 +709,10 @@ compositor_surface *compositor_surface_create(compositor *compositor)
 void compositor_surface_destroy(compositor_surface *csfc)
 {
 	DLOG("%s\n", __FUNCTION__);
+	if (csfc->shell_surface != NULL) {
+		csfc->shell_surface->alive = false;
+		shell_surface_detach_compositor_surface(csfc->shell_surface);
+	}
 	for (int i = 0; i < TEX_PLANE_NUM; i++) {
 		if (csfc->eglImg[i] != EGL_NO_IMAGE_KHR) {
 			eglDestroyImageKHR(egl_get_display(), csfc->eglImg[i]);
@@ -614,6 +721,7 @@ void compositor_surface_destroy(compositor_surface *csfc)
 			glDeleteTextures(1, &csfc->texid[i]);
 		}
 		free(csfc->prev_shm_data[i]);
+		pending_wl_buffer_untrack(csfc, i);
 	}
 
 	wl_list_remove(&csfc->link);
@@ -627,17 +735,16 @@ void compositor_surface_destroy(compositor_surface *csfc)
 		} else {
 			focused_csfc = top_csfc;
 			focused_csfc->pointer_focused = false;
-			if (focused_csfc &&
-			    focused_csfc->shell_surface->toplevel) {
+			if (focused_csfc->shell_surface != NULL &&
+			    focused_csfc->shell_surface->toplevel != NULL) {
 				focused_csfc->shell_surface->toplevel->pending
 					.state.activated = true;
 				struct wl_display *display =
 					csfc->compositor->wl_display;
 				struct wl_event_loop *loop =
 					wl_display_get_event_loop(display);
-				wl_event_loop_add_idle(
-					loop, xdg_send_configure_event,
-					focused_csfc->shell_surface);
+				schedule_xdg_configure(
+					loop, focused_csfc->shell_surface);
 			}
 		}
 	}
@@ -935,6 +1042,16 @@ static void wl_shell_surface_set_class(struct wl_client *wl_client,
 	DLOG("%s\n", __FUNCTION__);
 }
 
+static void destroy_wl_shell_surface_resource(struct wl_resource *resource)
+{
+	shell_surface *shell_surface = wl_resource_get_user_data(resource);
+
+	shell_surface->resource = NULL;
+	shell_surface->alive = false;
+	shell_surface_detach_compositor_surface(shell_surface);
+	shell_surface_unref(shell_surface);
+}
+
 static const struct wl_shell_surface_interface wl_shell_surface_implementation = {
 	.pong = wl_shell_surface_pong,
 	.move = wl_shell_surface_move,
@@ -967,22 +1084,29 @@ static void wl_shell_get_shell_surface(struct wl_client *wl_client,
 		return;
 	}
 	shell_surface->csfc = csfc;
+	shell_surface->alive = true;
 	shell_surface->resource =
 		wl_resource_create(wl_client, &wl_shell_surface_interface,
 				   wl_resource_get_version(resource), id);
 	if (shell_surface->resource == NULL) {
 		ELOG("%s\n", __FUNCTION__);
 		wl_client_post_no_memory(wl_client);
+		free(shell_surface);
+		return;
 	}
+	shell_surface->ref_count = 1;
 
 	wl_resource_set_implementation(shell_surface->resource,
 				       &wl_shell_surface_implementation,
-				       shell_surface, NULL);
-	if (focused_csfc && focused_csfc->shell_surface->toplevel) {
+				       shell_surface,
+				       destroy_wl_shell_surface_resource);
+	if (focused_csfc && focused_csfc->shell_surface != NULL &&
+	    focused_csfc->shell_surface->toplevel != NULL) {
 		focused_csfc->shell_surface->toplevel->pending.state.activated =
 			false;
 	}
 	csfc->shell_surface = shell_surface;
+	shell_surface_ref(shell_surface);
 	focused_csfc = csfc;
 	wl_list_insert(csfc->compositor->surface_list.prev, &csfc->link);
 }
@@ -1031,6 +1155,17 @@ void xdg_toplevel_protocol_destroy(struct wl_client *client,
 {
 	DLOG("%s\n", __FUNCTION__);
 	wl_resource_destroy(resource);
+}
+
+static void destroy_xdg_toplevel_resource(struct wl_resource *resource)
+{
+	shell_surface *shell_surface = wl_resource_get_user_data(resource);
+
+	if (shell_surface->toplevel != NULL) {
+		free(shell_surface->toplevel);
+		shell_surface->toplevel = NULL;
+		shell_surface_unref(shell_surface);
+	}
 }
 
 static void
@@ -1114,7 +1249,8 @@ xdg_toplevel_protocol_set_fullscreen(struct wl_client *wl_client,
 {
 	DLOG("%s\n", __FUNCTION__);
 	shell_surface *shell_surface = wl_resource_get_user_data(resource);
-	if (shell_surface != NULL) {
+	if (shell_surface->alive && shell_surface->csfc != NULL &&
+	    shell_surface->toplevel != NULL) {
 		shell_surface->toplevel->pending.state.fullscreen = true;
 		int width = shell_surface->csfc->compositor->width;
 		int height = shell_surface->csfc->compositor->height;
@@ -1125,8 +1261,7 @@ xdg_toplevel_protocol_set_fullscreen(struct wl_client *wl_client,
 			shell_surface->csfc->compositor->wl_display;
 		struct wl_event_loop *eloop =
 			wl_display_get_event_loop(display);
-		wl_event_loop_add_idle(eloop, xdg_send_configure_event,
-				       shell_surface);
+		schedule_xdg_configure(eloop, shell_surface);
 	}
 }
 
@@ -1135,7 +1270,8 @@ static void xdg_toplevel_protocol_unset_fullscreen(struct wl_client *wl_client,
 {
 	DLOG("%s\n", __FUNCTION__);
 	shell_surface *shell_surface = wl_resource_get_user_data(resource);
-	if (shell_surface != NULL) {
+	if (shell_surface->alive && shell_surface->csfc != NULL &&
+	    shell_surface->toplevel != NULL) {
 		shell_surface->toplevel->pending.state.fullscreen = false;
 		shell_surface->toplevel->pending.size.width = 0;
 		shell_surface->toplevel->pending.size.height = 0;
@@ -1143,8 +1279,7 @@ static void xdg_toplevel_protocol_unset_fullscreen(struct wl_client *wl_client,
 			shell_surface->csfc->compositor->wl_display;
 		struct wl_event_loop *eloop =
 			wl_display_get_event_loop(display);
-		wl_event_loop_add_idle(eloop, xdg_send_configure_event,
-				       shell_surface);
+		schedule_xdg_configure(eloop, shell_surface);
 	}
 }
 
@@ -1208,6 +1343,16 @@ static void xdg_surface_destroy(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+static void destroy_xdg_surface_resource(struct wl_resource *resource)
+{
+	shell_surface *shell_surface = wl_resource_get_user_data(resource);
+
+	shell_surface->resource = NULL;
+	shell_surface->alive = false;
+	shell_surface_detach_compositor_surface(shell_surface);
+	shell_surface_unref(shell_surface);
+}
+
 static void xdg_surface_get_toplevel(struct wl_client *wl_client,
 				     struct wl_resource *resource, uint32_t id)
 {
@@ -1228,11 +1373,15 @@ static void xdg_surface_get_toplevel(struct wl_client *wl_client,
 	if (toplevel->resource == NULL) {
 		ELOG("%s\n", __FUNCTION__);
 		wl_client_post_no_memory(wl_client);
+		free(toplevel);
+		return;
 	}
 
+	shell_surface_ref(shell_surface);
 	wl_resource_set_implementation(toplevel->resource,
 				       &xdg_toplevel_implementation,
-				       shell_surface, NULL);
+				       shell_surface,
+				       destroy_xdg_toplevel_resource);
 
 	shell_surface->toplevel = toplevel;
 }
@@ -1283,27 +1432,32 @@ static void xdg_shell_get_xdg_surface(struct wl_client *wl_client,
 		return;
 	}
 	shell_surface->csfc = csfc;
+	shell_surface->alive = true;
 	shell_surface->resource =
 		wl_resource_create(wl_client, &xdg_surface_interface,
 				   wl_resource_get_version(resource), id);
 	if (shell_surface->resource == NULL) {
 		ELOG("%s\n", __FUNCTION__);
 		wl_client_post_no_memory(wl_client);
+		free(shell_surface);
+		return;
 	}
+	shell_surface->ref_count = 1;
 
 	wl_resource_set_implementation(shell_surface->resource,
 				       &xdg_surface_implementation,
-				       shell_surface, NULL);
+				       shell_surface, destroy_xdg_surface_resource);
 
-	if (focused_csfc && focused_csfc->shell_surface->toplevel) {
+	if (focused_csfc && focused_csfc->shell_surface != NULL &&
+	    focused_csfc->shell_surface->toplevel != NULL) {
 		focused_csfc->shell_surface->toplevel->pending.state.activated =
 			false;
 		struct wl_display *display = csfc->compositor->wl_display;
 		struct wl_event_loop *loop = wl_display_get_event_loop(display);
-		wl_event_loop_add_idle(loop, xdg_send_configure_event,
-				       focused_csfc->shell_surface);
+		schedule_xdg_configure(loop, focused_csfc->shell_surface);
 	}
 	csfc->shell_surface = shell_surface;
+	shell_surface_ref(shell_surface);
 	focused_csfc = csfc;
 	wl_list_insert(csfc->compositor->surface_list.prev, &csfc->link);
 }
